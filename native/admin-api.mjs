@@ -7,7 +7,7 @@ import { isPlainObject, validateJson } from './contracts.mjs'
 
 export const NATIVE_ADMIN_BASE='/api/companion/v3'
 const PLATFORMS=['qq','bilibili','tieba']
-const EDITABLE_DOCUMENTS=new Set(['settings','activity','mood','speech','learning','qq','tieba','bilibili','bilibili-inbox'])
+const EDITABLE_DOCUMENTS=new Set(['settings','activity','mood','hormone','speech','learning','learning-loop','qq','tieba','bilibili','bilibili-inbox'])
 const PRIVATE_FIELD=/^(?:access_token|refresh_token|api_key|password|credentials?|credential_ref|cookies?|csrf|bili_jct|sessdata|buvid\d*|bduss|stoken)$/i
 const clone=value=>structuredClone(value)
 const local=value=>['localhost','127.0.0.1','[::1]','::1','::ffff:127.0.0.1'].includes(String(value).toLowerCase())
@@ -56,7 +56,7 @@ function send(res,status,value){res.writeHead(status,{'content-type':'applicatio
 const unavailable=message=>Object.assign(new Error(message||'此功能尚未就绪'),{httpStatus:503})
 const ownerContext={platform:'harness',conversation_id:'local-settings',owner_authorized:true,include_secret:false}
 
-export function createNativeAdminApi({store,profiles=new NativeProfileService({store}),memory=new NativeMemory(store),diary=new NativeDiary({store}),activity,
+export function createNativeAdminApi({store,profiles=new NativeProfileService({store}),memory=new NativeMemory(store),diary=new NativeDiary({store}),activity,hormone,learning_loop,consolidate_learning,tieba_atmosphere,
   platforms={},people,affinities,portability,connection,on_change}={}){
   if(!(store instanceof NativeStore))throw new Error('新版设置必须使用NativeStore')
   const ownerActivity=async()=>ownerActivityReports(store,activity?.status?await activity.status():{tasks:[],blocks:[],available:false})
@@ -73,14 +73,23 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     }
     const tasks=await ownerActivity()
     const budget=tasks.budget??null,mood=store.getDocument('mood')?.value.state??null
-    return {ok:true,version:3,schema_version:3,documents,profiles:persona,overview:{budget,mood,money_budget:tasks.money_budget??null,platforms:platformStatus},activity:tasks,
+    let hormoneStatus=null
+    try{if(typeof hormone?.status==='function')hormoneStatus=hormone.status()}catch{hormoneStatus={available:false}}
+    return {ok:true,version:3,schema_version:3,documents,profiles:persona,overview:{budget,mood,hormone:hormoneStatus,money_budget:tasks.money_budget??null,platforms:platformStatus},activity:tasks,
       capabilities:{documents:!store.readOnly,profiles:!store.readOnly,rounds:{bilibili:!!activity?.runOneRound&&!store.readOnly,tieba:!!activity?.runOneRound&&!store.readOnly},
-        memory:true,diary:true,people:typeof people==='function',portability:!!portability,
-        authentication:Object.fromEntries(PLATFORMS.map(p=>[p,!!platforms[p]?.login&&!store.readOnly])),platform_actions:{bilibili:{check_inbox:!!platforms.bilibili?.checkInbox&&!store.readOnly,reconcile_today:!!platforms.bilibili?.reconcileToday&&!store.readOnly},tieba:{check_inbox:!!platforms.tieba?.checkInbox&&!store.readOnly,inspect_page:!!platforms.tieba?.inspectPage&&!store.readOnly,check_private:!!platforms.tieba?.checkPrivate&&!store.readOnly}}}}
+        memory:true,diary:true,people:typeof people==='function',portability:!!portability,learning:{items:typeof learning_loop?.list==='function',manage:typeof learning_loop?.manage==='function'&&!store.readOnly,consolidate:typeof consolidate_learning==='function'&&!store.readOnly},
+        authentication:Object.fromEntries(PLATFORMS.map(p=>[p,!!platforms[p]?.login&&!store.readOnly])),platform_actions:{bilibili:{check_inbox:!!platforms.bilibili?.checkInbox&&!store.readOnly,reconcile_today:!!platforms.bilibili?.reconcileToday&&!store.readOnly},tieba:{atmosphere:typeof tieba_atmosphere?.list==='function',check_inbox:!!platforms.tieba?.checkInbox&&!store.readOnly,inspect_page:!!platforms.tieba?.inspectPage&&!store.readOnly,check_private:!!platforms.tieba?.checkPrivate&&!store.readOnly}}}}
   }
   const handlers=new Map(),route=(method,path,handler)=>handlers.set(method+' '+NATIVE_ADMIN_BASE+path,handler)
   route('GET','/snapshot',()=>snapshot())
   route('GET','/activity',async()=>({ok:true,...await ownerActivity()}))
+  route('GET','/tieba/atmosphere',async(_req,url)=>{
+    if([...url.searchParams.keys()].some(key=>key!=='bar'))throw new Error('吧内参考查询含未知字段')
+    if(!tieba_atmosphere?.list||!tieba_atmosphere?.profile)throw unavailable('吧内参考暂时无法读取')
+    const bar=url.searchParams.get('bar')
+    if(bar!==null){const value=tieba_atmosphere.profile({bar}),{sources,...summary}=value,samples=value.samples.slice(0,4).map(row=>({thread_id:row.thread_id,author_uid:row.author_uid,scene:row.scene,text:(()=>{let end=Math.min(240,row.text.length);if(end>0&&/[\uD800-\uDBFF]/.test(row.text[end-1])&&/[\uDC00-\uDFFF]/.test(row.text[end]??''))end--;return row.text.slice(0,end)})(),evidence_id:row.evidence_id,ref:value.sources.find(source=>source.evidence_id===row.evidence_id)?.ref??''}));return {ok:true,...summary,samples}}
+    return {ok:true,items:tieba_atmosphere.list().items.slice(0,50).map(({sources,...row})=>row)}
+  })
   for(const id of EDITABLE_DOCUMENTS)route('POST','/documents/'+id,async(req)=>{
     const body=await readBody(req);allowedKeys(body,['expected_revision','patch']);revision(body.expected_revision)
     const old=store.getDocument(id);if(!old)throw new Error('该项设置尚未初始化')
@@ -89,6 +98,8 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     const protectedFields=['account_entity_id','owner_entity_id','self_profile_id','default_persona_id','platform_document_ids',
       'activity_document_id','mood_document_id','speech_document_id','learning_document_id']
     if(Object.keys(body.patch).some(k=>protectedFields.includes(k))||id==='mood'&&Object.hasOwn(body.patch,'state'))throw new Error('请在对应的人设或账号入口修改此项')
+    if(id==='hormone'&&Object.keys(body.patch).some(key=>!['enabled','mode','policy'].includes(key)))throw new Error('精力和压力只能由真实活动变化，不能直接改写当前状态')
+    if(id==='learning'&&Object.hasOwn(body.patch,'active_revision')||id==='learning-loop'&&Object.keys(body.patch).some(key=>!['enabled','policy'].includes(key)))throw new Error('学习版本、来源和使用记录由实际学习过程维护，不能通过设置改写')
     if(id==='qq'&&Object.hasOwn(body.patch.qq??{},'relationships'))throw new Error('QQ亲疏由欧鲸鲸自主决定，不能通过设置指定名单')
     const value=merge(old.value,body.patch),document=store.putDocument({id,type:old.type,value,expected_revision:body.expected_revision})
     const effect=await on_change?.({document_id:id,type:old.type,revision:document.revision})
@@ -124,14 +135,18 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     if(!['memory','journal','pending'].includes(mode))throw new Error('不支持的记忆视图')
     const filter={query,limit:20,max_chars:1800}
     if(url.searchParams.get('platform'))filter.platform=url.searchParams.get('platform')
-    const result=mode==='pending'?memory.pendingConflicts({limit:20,max_chars:1800},ownerContext)
+    let result=mode==='pending'?memory.pendingConflicts({limit:20,max_chars:1800},ownerContext)
       :mode==='journal'?memory.searchJournal(filter,ownerContext):memory.recall(filter,ownerContext)
+    if(mode==='memory'&&!filter.platform&&typeof learning_loop?.searchMemory==='function'){
+      const learned=learning_loop.searchMemory({query,limit:1,max_chars:360},ownerContext)
+      if(learned.items.length){const lines=learned.items.map(item=>item.id+' '+item.label+'（'+item.status+'）：'+item.summary),budget=1800-lines.join('\n').length-1;result=memory.recall({...filter,max_chars:budget},ownerContext);result={...result,items:[...learned.items,...result.items],text:[lines.join('\n'),result.text].filter(Boolean).join('\n'),abstained:false,untrusted:true}}
+    }
     return {ok:true,...result}
   })
   route('GET','/memory/read',(_req,url)=>{
     const id=url.searchParams.get('id'),offset=Number(url.searchParams.get('offset')??0)
     const input={id,offset,max_chars:1800}
-    let detail=memory.readEntry(input,ownerContext)
+    let detail=id?.startsWith('learning-card:')&&typeof learning_loop?.readMemory==='function'?learning_loop.readMemory(input,ownerContext):memory.readEntry(input,ownerContext)
     if(!detail.found)detail=memory.readEvidence(input,ownerContext)
     if(!detail.found){const event=store.getJournalEvent(id);if(event&&event.visibility!=='secret'){
       const text=event.text, end=Math.min(text.length,offset+1800)
@@ -150,6 +165,41 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     const body=await readBody(req);allowedKeys(body,['query'])
     if(!activity?.enqueue)throw unavailable('记忆整理执行器尚未就绪')
     return {ok:true,...await activity.enqueue({platform:'bilibili',kind:'maintenance',trigger:'manual',target:{maintenance_kind:'memory',query:body.query??''},heavy:true,human:false})}
+  })
+  route('GET','/learning/items',async(_req,url)=>{
+    if(typeof learning_loop?.list!=='function')throw unavailable('学过的表达暂时无法读取')
+    if([...url.searchParams.keys()].some(key=>!['query','status','limit'].includes(key)))throw new Error('学习筛选包含不支持的字段')
+    const query=url.searchParams.get('query')??'',status=url.searchParams.get('status')||undefined,limit=Number(url.searchParams.get('limit')??30)
+    if(query.length>240||status&&!['trial','active','paused','retired'].includes(status)||!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('学习筛选范围无效')
+    const result=await learning_loop.list({query,...(status?{status}:{}),limit},ownerContext)
+    if(!Array.isArray(result?.items))throw unavailable('学习记录尚未返回有效列表')
+    const statusResult=typeof learning_loop.status==='function'?await learning_loop.status(ownerContext):null
+    return {ok:true,...result,...(statusResult?{summary:{enabled:statusResult.enabled,counts:statusResult.counts,revision:statusResult.revision,pending_sources:statusResult.pending_sources}}:{})}
+  })
+  route('GET','/learning/status',async()=>{
+    if(typeof learning_loop?.status!=='function')throw unavailable('学习状态暂时无法读取')
+    const result=await learning_loop.status(ownerContext)
+    return {ok:true,enabled:result.enabled,counts:result.counts,revision:result.revision,pending_sources:result.pending_sources}
+  })
+  route('GET','/learning/detail',async(_req,url)=>{
+    if(typeof learning_loop?.detail!=='function')throw unavailable('学习应用记录暂时无法读取')
+    if([...url.searchParams.keys()].some(key=>!['id','limit'].includes(key)))throw new Error('学习详情包含不支持的字段')
+    const id=url.searchParams.get('id'),limit=Number(url.searchParams.get('limit')??10)
+    if(typeof id!=='string'||!id||id.length>160||!Number.isSafeInteger(limit)||limit<1||limit>20)throw new Error('学习详情范围无效')
+    return {ok:true,...await learning_loop.detail({id,limit},ownerContext)}
+  })
+  route('POST','/learning/consolidate',async(req)=>{
+    const body=await readBody(req);allowedKeys(body,[])
+    if(typeof consolidate_learning!=='function')throw unavailable('学习整理暂时无法启动')
+    const result=await consolidate_learning()
+    if(!isPlainObject(result))throw unavailable('学习整理尚未返回有效结果')
+    return {ok:true,...result}
+  })
+  route('POST','/learning/manage',async(req)=>{
+    const body=await readBody(req);allowedKeys(body,['id','operation','expected_revision','version']);revision(body.expected_revision)
+    if(typeof body.id!=='string'||!body.id||body.id.length>160||!['pause','resume','rollback','retire'].includes(body.operation)||body.version!==undefined&&(!Number.isSafeInteger(body.version)||body.version<1||body.operation!=='rollback'))throw new Error('请选择有效学习项、操作和版本')
+    if(typeof learning_loop?.manage!=='function')throw unavailable('学习项管理暂时无法使用')
+    return {ok:true,...await learning_loop.manage(body,ownerContext)}
   })
   for(const platform of PLATFORMS)route('POST','/platforms/'+platform+'/login',async(req)=>{
     if(!platforms[platform]?.login)throw unavailable('该平台登录入口尚未接入')

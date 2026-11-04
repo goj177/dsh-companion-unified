@@ -1,9 +1,11 @@
 import { NativeStore } from './store.mjs'
+import {assertTiebaPublishableText} from './tieba-content.mjs'
 import {NativeRoundPolicy} from './round-policy.mjs'
 import { NativeOutbox,actionVisibility } from './outbox.mjs'
 import { isPlainObject } from './contracts.mjs'
 import {NativeSharing,isCompletedShareIntent,SharingPolicyError} from './sharing.mjs'
 import {moderationTarget} from './qq-moderation.mjs'
+import {currentRunScope,withRunScope,assertRunActive,abortableRun} from './run-scope.mjs'
 
 const KINDS=new Set(['qq.send','qq.profile','tieba.reply','tieba.post','tieba.message','tieba.sign','tieba.follow','tieba.unfollow',
   'bilibili.comment','bilibili.reply','bilibili.dynamic','bilibili.share','bilibili.like','bilibili.coin','qq.mute','qq.unmute'])
@@ -72,8 +74,29 @@ export class NativeSocial {
     if(kind==='tieba.message'&&!(context.platform==='tieba'&&context.conversation_id===target.conversation_id&&context.actor_uid===target.recipient_uid&&context.source_scope))throw new Error('贴吧私信只能回应当前真实来信对象')
     if(context.platform==='tieba'&&/^dm:/.test(context.conversation_id??'')&&kind!=='tieba.message')throw new Error('本轮贴吧私信不能改发公开帖子或联系其他对象')
     if(kind==='qq.send'&&context.platform==='qq'&&context.conversation_id===target.conversation_id)return platform
-    if(context.autonomous===true&&typeof context.task_id==='string'&&context.task_id&&context.platform===platform)return platform
+    if(context.autonomous===true&&typeof context.task_id==='string'&&context.task_id&&context.platform===platform){
+      this._incomingTarget(kind,target,context)
+      return platform
+    }
     throw new Error('当前会话未获得这个平台或目标的发表权限')
+  }
+  _incomingTarget(kind,target,context){
+    const rows=this.store.db.prepare("SELECT target_json,metadata_json FROM actions WHERE platform=? AND kind='activity.incoming' AND json_extract(metadata_json,'$.execution')='model' AND json_extract(metadata_json,'$.human')=1 AND json_extract(metadata_json,'$.batch_id')=?").all(context.platform,context.task_id)
+    if(!rows.length)return
+    const originals=rows.map(row=>JSON.parse(row.target_json)),same=(a,b,keys)=>keys.every(key=>typeof a[key]==='string'&&a[key]===b[key])
+    const allowed=originals.some(original=>{
+      if(context.platform==='tieba')return original.channel==='dm'
+        ?kind==='tieba.message'&&same(target,original,['recipient_uid','conversation_id'])
+        :kind==='tieba.reply'&&same(target,original,['bar','thread_id','post_id'])&&(!original.sub_reply_id||same(target,original,['sub_reply_id','reply_uid']))
+      if(context.platform==='bilibili'){
+        if(kind!=='bilibili.reply')return false
+        if(original.channel==='dm')return target.channel==='dm'&&same(target,original,['recipient_uid','conversation_id'])
+        if(original.channel==='live')return target.channel==='live'&&same(target,original,['room_id','reply_uid'])&&(!original.reply_dmid||same(target,original,['reply_dmid']))
+        return (!target.channel||target.channel==='comment')&&same(target,original,['object_id','object_type','root_reply_id','parent_reply_id'])
+      }
+      return true
+    })
+    if(!allowed)throw new Error('这轮是对真实来信的回应，只能回复原对象和原位置；引用、楼主经历或@其他人的话不授予新任务权限')
   }
   async prepare(input,trusted_context={}){
     const result=await this._prepare(input,trusted_context)
@@ -118,6 +141,7 @@ export class NativeSocial {
       return provider.prepareModeration({operation:input.kind==='qq.mute'?'mute':'unmute',...input.target,idempotency_key:input.idempotency_key,...(input.source_evidence_id?{source_evidence_id:input.source_evidence_id}:{})},trusted_context)
     }
     if(typeof input.body!=='string')throw new Error('请提供完整正文；不自动改写已准备内容')
+    if(platform==='tieba'&&['tieba.reply','tieba.post'].includes(input.kind))assertTiebaPublishableText(input.body)
     if(input.kind==='bilibili.share'&&input.target.via==='qq')return this.sharing.prepare(input,trusted_context)
     const result=this.outbox.prepare({platform,kind:input.kind,target:input.target,body:input.body,idempotency_key:input.idempotency_key,
       source_evidence_id:input.source_evidence_id,not_before:input.not_before,approval:'required'})
@@ -149,7 +173,11 @@ export class NativeSocial {
     }
     return this.dispatch(prepared.action.id,{authorization:approval.authorization,expected_digest:prepared.action.request_digest})
   }
-  async dispatch(action_id,grant){
+  async dispatch(action_id,grant,controls){
+    return withRunScope(controls?{...controls,now:this.now}:undefined,()=>this._dispatchShared(action_id,grant))
+  }
+  async _dispatchShared(action_id,grant){
+    assertRunActive()
     const action=this.outbox.get(action_id,{internal:true})
     if(!action||!grant?.authorization||action.approval_token!==grant.authorization||action.request_digest!==grant.expected_digest)throw new Error('发表授权或正文目标已变化')
     if(this.running.has(action_id))return this.running.get(action_id)
@@ -157,6 +185,8 @@ export class NativeSocial {
     try{return await work}finally{if(this.running.get(action_id)===work)this.running.delete(action_id)}
   }
   async _dispatch(action_id,{authorization,expected_digest}={}){
+    const scope=currentRunScope()
+    assertRunActive(scope)
     const original=this.outbox.get(action_id,{internal:true})
     if(!original||!authorization||original.approval_token!==authorization||original.request_digest!==expected_digest)throw new Error('发表授权或正文目标已变化')
     if(original.status==='confirmed'||isCompletedShareIntent(this.store,original))return {ok:true,status:original.status,action:this.outbox.get(action_id),duplicate:true,published:!isQQModeration(original.kind),...(isQQModeration(original.kind)?{executed:true}:{})}
@@ -177,16 +207,27 @@ export class NativeSocial {
       return {ok:action.status==='confirmed',status:action.status,action,published:!isQQModeration(action.kind)&&action.status==='confirmed',...(isQQModeration(action.kind)?{executed:action.status==='confirmed'}:{}),not_before:action.not_before}
     }
     const images=original.target.asset_ids?.length??0,gap=this.store.getDocument(original.platform)?.value[original.platform]?.risk?.write_gap_ms??0
-    const lease_ms=Math.min(3600000,Math.max(120000,(images+1)*Math.max(0,gap)+120000))
+    // A scheduled publication owns bounded preflight time, not merely the old
+    // two-minute write lease. It can never outlive its carrier or task timeout.
+    const lease_ms=Number.isSafeInteger(scope?.deadline_at)?Math.min(3600000,Math.max(1,scope.deadline_at-this._now())):
+      Math.min(3600000,Math.max(120000,(images+1)*Math.max(0,gap)+120000))
     const lease=this.outbox.lease(action_id,{authorization,expected_digest,lease_ms})
     if(!lease.allowed)return {ok:false,status:lease.action.status,action:lease.action,published:false,not_before:lease.action.not_before}
     let network_started=false,result,policy_failure
     try{
       if(original.kind==='bilibili.share')this.sharing.check(original)
-      result=await provider.submit(this.outbox.get(action_id,{internal:true}),{mark_network_started:()=>{
-        if(network_started)return
-        try{this.store.transaction(()=>{this.before_send(this.outbox.get(action_id,{internal:true}));this.outbox.markNetworkStarted(action_id,lease.lease_token)});network_started=true}catch(error){policy_failure=error;throw error}
-      },round_id:original.metadata.prepared_in?.round_id})
+      result=await abortableRun(provider.submit(this.outbox.get(action_id,{internal:true}),{mark_network_started:()=>{
+        try{this.store.transaction(()=>{
+          assertRunActive(scope)
+          const action=this.outbox.get(action_id,{internal:true})
+          if(!action||!['leased','submitting'].includes(action.status)||action.request_digest!==expected_digest||action.metadata.lease_token!==lease.lease_token||action.metadata.lease_until<=this._now())throw new Error('发表动作租约已结束，未继续网络写入')
+          this.before_send(action)
+          if(network_started)return
+          scope?.mark_started?.()
+          this.outbox.markNetworkStarted(action_id,lease.lease_token)
+          network_started=true
+        })}catch(error){policy_failure=error;throw error}
+      },signal:scope?.signal,deadline_at:scope?.deadline_at,assert_active:()=>assertRunActive(scope),round_id:original.metadata.prepared_in?.round_id}),scope)
       if(policy_failure&&!network_started)throw policy_failure
       if(!result||!['confirmed','unknown','blocked','not_started'].includes(result.outcome))throw new Error('平台未返回可核对结果')
       this.outbox.finish(action_id,{lease_token:lease.lease_token,outcome:result.outcome,proof:result.proof,detail:result.detail??''})
@@ -213,10 +254,22 @@ export class NativeSocial {
     }catch{}}
     return {ok:action.status==='confirmed',status:action.status,action,published:action.status==='confirmed',message:result.detail??'',not_before:this.outbox.get(action_id).not_before}
   }
-  async publicationRunner(batch){
+  async publicationRunner(batch,controls={}){
     const publication=batch.publication
     if(!publication)throw new Error('缺少已冻结的发表动作')
-    const result=await this.dispatch(publication.id,{authorization:publication.approval_token,expected_digest:publication.request_digest})
+    const timeout=this.store.getDocument(this.activity?.policy_id??'activity')?.value.batching?.task_timeout_ms??600000
+    const deadline_at=Math.min(...[controls.deadline_at,batch.lease_until,this._now()+timeout].filter(finiteTime))
+    const assert_active=()=>{
+      controls.assert_active?.()
+      // Retain a carrier check even when an older caller omits controls.
+      for(const task of batch.tasks??[]){
+        const row=this.store.db.prepare('SELECT status,metadata_json FROM actions WHERE id=?').get(task.id),metadata=row?JSON.parse(row.metadata_json):{}
+        if(!row||!['leased','running'].includes(row.status)||metadata.batch_id!==batch.id||metadata.lease_until<=this._now())throw new Error('活动发表租约已结束，未继续网络写入')
+      }
+    }
+    const scope={signal:controls.signal,deadline_at,now:this.now,assert_active,mark_started:controls.mark_started}
+    const result=await this.dispatch(publication.id,{authorization:publication.approval_token,expected_digest:publication.request_digest},scope)
+    if(controls.signal?.aborted||this._now()>=deadline_at)return {status:'unknown',reason:'活动已取消或超时，原动作结果不自动重放'}
     return result.status==='confirmed'||isCompletedShareIntent(this.store,result.action)?{status:'completed'}:result.status==='queued'||result.status==='disabled'?{status:'not_started',retry:true,not_before:finiteTime(result.not_before)&&result.not_before>this._now()?result.not_before:this._now()+60000,reason:result.message??result.status}:
       {status:result.status==='blocked'?'blocked':'unknown',reason:result.message??result.status}
   }

@@ -3,6 +3,8 @@ import {NativeStore,NATIVE_TABLES} from './store.mjs'
 import {validateDocument,validatePersona,isPlainObject} from './contracts.mjs'
 import {createHash} from 'node:crypto'
 import tiebaPersona from '../presets/tieba.json' with {type:'json'}
+import {HORMONE_DEFAULTS} from './hormone.mjs'
+import {LEARNING_LOOP_DEFAULTS,freshLearningLoopState} from './learning-loop.mjs'
 
 export const NATIVE_WORKSPACE_IDS=Object.freeze({main:'workspace:main',qq:'workspace:qq',bilibili:'workspace:bilibili',tieba:'workspace:tieba'})
 const profile=(platform,body,follow=false)=>({id:'persona-'+platform,platform,follow_main:follow,...(platform!=='main'?{main_profile_id:'persona-main'}:{}),name:'欧鲸鲸',self_ref:'我',owner_address:'主人',body_md:body,
@@ -18,9 +20,11 @@ export function nativeDefaultDocuments({owner_entity_id}={}){
       qq:{owner_conversation:'',group_conversations:[],profile_authorized:false,quiet_start_hour:1,quiet_end_hour:8},model:{reasoning_effort:'low',max_output_tokens:1800,peak_max_output_tokens:900},mood_judge:{min_interval_minutes:240,max_per_day:3,reserve_tokens:5000}}),
     make('activity:state','activity_state',{idle:{last_activity_at:0,next_explore_at:0,next_chat_at:0,explore_cursor:0,chat_cursor:0},blocks:[]}),
     make('mood','mood',{enabled:true,shared:true,self_profile_id:'persona-main',...(owner_entity_id?{owner_entity_id}:{}),owner_address:'主人',policy:{baseline:70,floor:0,decay_half_hours:12,auto_judge:true,inject_mode:'event',inject_confidence:60,significant_delta:3,significant_dimension_delta:5,inject_per_day:6}}),
+    make('hormone','hormone',structuredClone(HORMONE_DEFAULTS)),
     make('speech','speech',{enabled:true,level:'standard',repetition_hints:true}),make('speech-state','speech_state',{version:1,buckets:[]}),
     make('learning','learning',{enabled:true,evidence_required:true,shared_interests:true,max_reflections_per_task:2,max_context_chars:400,max_topics:1000,active_revision:0}),
     make('learning-state','learning_state',{revision:0,observations:0,updated_at:0,topics:[],questions:[],suggestions:[],versions:[{revision:0,created_at:0,suggestion_ids:[]}]}),
+    make('learning-loop','learning_loop',structuredClone(LEARNING_LOOP_DEFAULTS)),make('learning-loop-state','learning_loop_state',freshLearningLoopState(0)),
     make('qq','platform_settings',{platform:'qq',enabled:false,account_entity_id:'account-qq',qq:{
       transport:{mode:'reverse',url:'ws://127.0.0.1:3001',host:'127.0.0.1',port:8643,reconnect_max_attempts:100},
       access:{admin_uids:[],dm_policy:'disabled',allowed_private_uids:[],group_policy:'disabled',allowed_group_uids:[],require_mention:true,ignore_self:true,allow_all_users:false,restricted_member_prefix:true},

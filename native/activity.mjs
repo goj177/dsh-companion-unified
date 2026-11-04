@@ -4,6 +4,7 @@ import { NativeBudget } from './budget.mjs'
 import { isPlainObject,validateJson,stringifyJson } from './contracts.mjs'
 import { shanghaiTime,valleyDecision } from '../policy.mjs'
 import {isCompletedShareIntent} from './sharing.mjs'
+import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
 
 const PLATFORMS=['qq','tieba','bilibili']
 const KINDS=['explore','incoming','chat','maintenance']
@@ -60,7 +61,7 @@ export class NativeActivity {
     this.runner=options.runner;this.publication_runner=options.publication_runner;this.money=options.money_budget;if(this.money&&this.money.store!==this.store)throw new Error('费用预算必须同库')
   }
   _now(){this.store._open();return time(this.now(),'活动时钟')}
-  _policy(){const doc=this.store.getDocument(this.policy_id);if(doc&&doc.type!=='activity')throw new Error('活动策略文档类型无效');return doc?.value??{enabled:false}}
+  _policy(){const doc=this.store.getDocument(this.policy_id);if(doc&&doc.type!=='activity')throw new Error('活动策略文档类型无效');return effectiveActivityPolicy({store:this.store,document_id:this.policy_id,now:this.now})}
   _state(){
     const doc=this.store.getDocument(this.state_id);if(doc&&doc.type!=='activity_state')throw new Error('活动状态文档类型无效')
     const p=this._policy(),now=this._now()
@@ -85,6 +86,7 @@ export class NativeActivity {
   }
   _enqueue(input){
     fields(input,['platform','kind','trigger','idempotency_key','target','body','source_evidence_id','not_before','estimated_tokens','human','heavy','execution','initial_status'])
+    if(!this.store.readOnly)restoreExpiredBudgetOverrides({store:this.store,now:this.now})
     const p=this._policy(),platform=choice(input.platform,PLATFORMS,'platform'),kind='activity.'+choice(input.kind,KINDS,'kind'),trigger=choice(input.trigger??(input.human?'incoming':'autonomous'),['manual','autonomous','incoming'],'trigger')
     const execution=choice(input.execution??'model',['model','publication'],'execution'),body=text(input.body??'','body',200000),target=targetOf(input.target??{})
     if(input.human!==undefined&&typeof input.human!=='boolean'||input.heavy!==undefined&&typeof input.heavy!=='boolean')throw new Error('human/heavy必须为布尔值')
@@ -336,7 +338,10 @@ export class NativeActivity {
     if(task.platform==='qq')return target?'qq-conversation:'+target:'isolated:'+task.id
     const evidence=task.source_evidence_id?this.store.db.prepare('SELECT platform,conversation_id,visibility FROM evidence WHERE id=?').get(task.source_evidence_id):null
     if(evidence&&evidence.platform===task.platform){
-      if(evidence.visibility==='public')return 'public:'+task.platform
+      if(evidence.visibility==='public'){
+        if(task.platform==='tieba'&&task.kind==='activity.incoming'){let bar=String(task.target.bar??'').trim();if(/%[0-9a-f]{2}/i.test(bar))try{bar=decodeURIComponent(bar)}catch{return 'isolated:'+task.id}return bar?'public:tieba:bar:'+bar:'isolated:'+task.id}
+        return 'public:'+task.platform
+      }
       if(evidence.conversation_id&&(!target||target===evidence.conversation_id))return 'private:'+task.platform+':'+evidence.visibility+':'+evidence.conversation_id
       return 'isolated:'+task.id
     }
@@ -412,16 +417,18 @@ export class NativeActivity {
   }
   async tick(options={}){
     fields(options,['idle','platform','execution']);if(options.idle!==undefined&&typeof options.idle!=='boolean')throw new Error('idle必须为布尔值');if(options.platform!==undefined)choice(options.platform,PLATFORMS,'平台');if(options.execution!==undefined)choice(options.execution,['model','publication'],'执行阶段');this.store._write()
+    if(!this.store.readOnly)restoreExpiredBudgetOverrides({store:this.store,now:this.now})
     const claim=this._claim(options)
     if(!claim.batch)return {dispatched:false,...claim}
     const {batch,lease_token}=claim,controller=new AbortController(),timeout_ms=this._policy().batching?.task_timeout_ms??600000
+    const deadline_at=Math.min(batch.lease_until,this._now()+timeout_ms),remaining_ms=Math.max(0,deadline_at-this._now())
     let timer,result
-    const controls={signal:controller.signal,mark_started:()=>this._markStarted(batch,lease_token),record_usage:usage=>{fields(usage,['total_tokens']);return this._recordUsage(batch,usage.total_tokens)}}
+    const controls={signal:controller.signal,deadline_at,assert_active:()=>{if(controller.signal.aborted)throw controller.signal.reason;return this._batchRows(batch,lease_token)},mark_started:()=>this._markStarted(batch,lease_token),record_usage:usage=>{fields(usage,['total_tokens']);return this._recordUsage(batch,usage.total_tokens)}}
     const runner=batch.execution==='publication'?this.publication_runner:this.runner
     const packet=batch.execution==='publication'?{...batch,publication:this._publication(this._get(batch.tasks[0].id,true))}:batch
     try{
-      const running=Promise.resolve().then(()=>runner(packet,controls));running.catch(()=>{})
-      result=await Promise.race([running,new Promise(resolve=>{timer=setTimeout(()=>{controller.abort();resolve({status:'unknown',reason:'活动执行超时，结果未知，不自动重放'})},timeout_ms)})])
+      const running=Promise.resolve().then(()=>{controls.assert_active();return runner(packet,controls)});running.catch(()=>{})
+      result=await Promise.race([running,new Promise(resolve=>{timer=setTimeout(()=>{controller.abort(new Error('活动执行超时，未继续执行'));resolve({status:'unknown',reason:'活动执行超时，结果未知，不自动重放'})},remaining_ms)})])
       if(!isPlainObject(result))result={status:'unknown',reason:'runner未返回明确执行状态'}
     }catch(error){
       const started=this._get(batch.tasks[0].id,true)?.metadata.dispatch_started===true

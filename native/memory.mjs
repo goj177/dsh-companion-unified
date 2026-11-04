@@ -58,7 +58,11 @@ export class NativeMemory {
     }
   }
   _now(){return timestamp(this.now(),'记忆时钟')}
-  _entry(id){return entryRow(this.store.db.prepare(ENTRY_SELECT+' WHERE id=?').get(id))}
+  _entry(id){return this._projectEntry(entryRow(this.store.db.prepare(ENTRY_SELECT+' WHERE id=?').get(id)))}
+  _projectEntry(row){
+    if(row?.status==='active'&&row.entity_type==='experience'&&this._entryRank(row)===0)return {...row,stored_status:row.status,status:'pending_confirmation',reason:'历史经历缺少助手实际发出动作的确认回执；原作者叙述不作为自己的亲历，原记录和来源保留'}
+    return row
+  }
   _rawEvidence(id){return evidenceRow(this.store.db.prepare(EVIDENCE_SELECT+' WHERE id=?').get(id))}
   _relate(subject_kind,subject_id,relation,object_kind,object_id,metadata={}) {
     const id='relation:'+digest(stringifyJson([subject_kind,subject_id,relation,object_kind,object_id]))
@@ -70,7 +74,18 @@ export class NativeMemory {
     return this.store.db.prepare("SELECT object_id FROM relations WHERE subject_kind='memory_entry' AND subject_id=? AND relation='supported_by' AND object_kind='evidence' ORDER BY object_id").all(id)
       .map(row=>this._effectiveEvidence(row.object_id)).filter(Boolean)
   }
-  _supportedForType(row,memory_type,entity_type){return canonicalEvidenceRank(row)>0&&(memory_type==='asserted'?row.confirmation==='user_statement':memory_type==='observed'?row.confirmation==='source_observation'||row.confirmation==='server_receipt'&&(row.direction==='observation'||entity_type==='experience'&&row.direction==='out'):false)}
+  _supportedForType(row,memory_type,entity_type){
+    if(canonicalEvidenceRank(row)<=0)return false
+    if(entity_type==='experience')return memory_type==='observed'&&row.confirmation==='server_receipt'&&row.direction==='out'&&row.source_type==='server_action'
+    if(memory_type==='asserted')return row.confirmation==='user_statement'
+    if(memory_type!=='observed')return false
+    // Reading somebody's first-person account proves a source was read. It
+    // does not prove the companion performed the narrated act. Own experience
+    // needs its own confirmed outward action; source accounts remain knowledge
+    // or attributed statements. This also downgrades unsupported old entries
+    // on projection without deleting their immutable evidence/history.
+    return row.confirmation==='source_observation'||row.confirmation==='server_receipt'&&row.direction==='observation'
+  }
   _entryRank(row){
     if(!row||row.memory_type==='inferred'||row.memory_type==='recorded')return 0
     const sources=this._support(row.id).filter(source=>this._supportedForType(source,row.memory_type,row.entity_type)&&directlySupports(source.text,{object:row.object,content:row.object,predicate:row.predicate}))
@@ -280,12 +295,13 @@ export class NativeMemory {
   }
 
   _describeEntry(row,context) {
+    row=this._projectEntry(row)
     const supported=this._support(row.id),evidence_ids=supported.filter(item=>visible(item,context)).map(item=>item.id)
     const related=this.store.db.prepare("SELECT relation,object_id FROM relations WHERE subject_kind='memory_entry' AND subject_id=? AND object_kind='memory_entry' AND relation IN ('supersedes','contradicts') ORDER BY relation,object_id").all(row.id)
       .filter(item=>this._canEntry(this._entry(item.object_id),context))
     return {id:row.id,level:row.level,entity_type:row.entity_type,subject:row.subject,predicate:row.predicate,object:row.object,content:row.content,title:row.title,keywords:row.keywords,
       project:row.project,goal:row.goal,importance:row.importance,corrected:row.corrected,scope:row.scope,visibility:row.visibility,platform:row.platform,conversation_id:row.conversation_id,actor_entity_id:row.actor_entity_id,
-      memory_type:row.memory_type,status:row.status,label:entryLabel(row),reason:row.reason,source_at:row.source_at,valid_from:row.valid_from,valid_until:row.valid_until,
+      memory_type:row.memory_type,status:row.status,...(row.stored_status?{stored_status:row.stored_status}:{}),label:entryLabel(row),reason:row.reason,source_at:row.source_at,valid_from:row.valid_from,valid_until:row.valid_until,
       evidence_ids,private_source_count:supported.length-evidence_ids.length,relations:related.map(item=>({relation:item.relation,id:item.object_id})),untrusted:true}
   }
   _writeDescription(row,context) {
@@ -339,7 +355,7 @@ export class NativeMemory {
     if(!q.terms.length)return noResult('请提供具体问题或关键词；没有依据时不补全记忆。')
     const {conditions,parameters}=this._conditions(input,q)
     conditions.push("status='active'",'(valid_from IS NULL OR valid_from<=?)','(valid_until IS NULL OR valid_until>?)');parameters.push(this._now(),this._now())
-    const rows=this.store.db.prepare(ENTRY_SELECT+' WHERE '+conditions.join(' AND ')+' ORDER BY source_at DESC,id').all(...parameters).map(entryRow).filter(row=>this._canEntry(row,context))
+    const rows=this.store.db.prepare(ENTRY_SELECT+' WHERE '+conditions.join(' AND ')+' ORDER BY source_at DESC,id').all(...parameters).map(entryRow).filter(row=>this._canEntry(row,context)).map(row=>this._projectEntry(row)).filter(row=>row.status==='active')
     const ranks=new Map(),rank=row=>{if(!ranks.has(row.id))ranks.set(row.id,this._entryRank(row));return ranks.get(row.id)}
     rows.sort((a,b)=>searchScore(b.content,q.terms)-searchScore(a.content,q.terms)||rank(b)-rank(a)||(b.source_at??0)-(a.source_at??0))
     const result=this._renderEntries(rows,q,context)
@@ -404,7 +420,7 @@ export class NativeMemory {
   pendingConflicts(input = {}, trusted_context = {}) {
     this.store._open();fields(input,['limit','max_chars'],'待确认记忆');const context=contextOf(trusted_context)
     const q={limit:integer(input.limit??8,'limit',1,30),max_chars:integer(input.max_chars??1800,'max_chars',96,1800),terms:[]}
-    const rows=this.store.db.prepare(ENTRY_SELECT+" WHERE status IN ('pending_conflict','pending_inference','pending_confirmation','pending_scope') ORDER BY updated_at DESC,id").all().map(entryRow).filter(row=>this._canEntry(row,context))
+    const rows=this.store.db.prepare(ENTRY_SELECT+" WHERE status IN ('pending_conflict','pending_inference','pending_confirmation','pending_scope') OR (status='active' AND entity_type='experience') ORDER BY updated_at DESC,id").all().map(entryRow).filter(row=>this._canEntry(row,context)).map(row=>this._projectEntry(row)).filter(row=>row.status.startsWith('pending_'))
     return this._renderEntries(rows,q,context)
   }
   forget(input, trusted_context = {}) {

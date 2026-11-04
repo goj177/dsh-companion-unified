@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { NativeStore } from './store.mjs'
 import { stringifyJson } from './contracts.mjs'
 import { shanghaiTime, valleyDecision } from '../policy.mjs'
+import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
 
 const hash = value => createHash('sha256').update(value).digest('hex')
 const nonnegative = value => Number.isSafeInteger(value) && value >= 0
@@ -14,7 +15,8 @@ export class NativeBudget {
     this.store = store; this.now = now; this.policyId = policy_document_id; this.quotaPrefix = quota_prefix; this.wakeKinds = new Map()
   }
   _now() { const at = this.now(); if (!nonnegative(at)) throw new Error('预算时钟无效'); return at }
-  _policy() { const doc = this.store.getDocument(this.policyId); if (doc && doc.type !== 'activity') throw new Error('预算文档类型错误'); return doc?.value || { enabled: false } }
+  _policy() { const doc = this.store.getDocument(this.policyId); if (doc && doc.type !== 'activity') throw new Error('预算文档类型错误'); return effectiveActivityPolicy({store:this.store,document_id:this.policyId,now:this.now}) }
+  _restore() { if(!this.store.readOnly)restoreExpiredBudgetOverrides({store:this.store,now:this.now}) }
   _state() { return new Map() }
   _day(state, date) {
     if (state.has(date)) return state.get(date)
@@ -72,6 +74,7 @@ export class NativeBudget {
       || !nonnegative(estimated_tokens) || estimated_tokens < 1 || typeof human !== 'boolean' || typeof heavy !== 'boolean' || typeof manual !== 'boolean'
       || trigger!==undefined&&!['autonomous','manual','incoming'].includes(trigger)||manual&&trigger!==undefined&&trigger!=='manual') throw new Error('模型预算预留参数无效')
     const wake_kind=trigger??(manual?'manual':human?'incoming':'autonomous');manual=wake_kind==='manual'
+    this._restore()
     return this.store.transaction(() => {
       this.expire()
       const at = this._now(), policy = this._policy(), budgetPolicy = policy.budget || {}
@@ -103,6 +106,7 @@ export class NativeBudget {
     })
   }
   markStarted(id) {
+    this._restore()
     return this.store.transaction(() => {
       const { row, metadata } = this._row(id)
       if (!metadata.reservation_open || metadata.started || row.status !== 'reserved') throw new Error('模型预留不能重复开始')
@@ -114,6 +118,7 @@ export class NativeBudget {
   }
   recordUsage(id, { total_tokens } = {}) {
     if (!nonnegative(total_tokens)) throw new Error('实际用量必须是本次任务累计非负整数')
+    this._restore()
     return this.store.transaction(() => {
       const { metadata } = this._row(id)
       if (metadata.actual_known && total_tokens <= metadata.actual_tokens) return { updated: false, actual_tokens: metadata.actual_tokens }
@@ -131,6 +136,7 @@ export class NativeBudget {
   }
   finish(id, { outcome = 'completed', total_tokens } = {}) {
     if (!['completed','unknown','not_started'].includes(outcome)) throw new Error('模型预算结束状态无效')
+    this._restore()
     return this.store.transaction(() => {
       if (total_tokens !== undefined) this.recordUsage(id, { total_tokens })
       const { metadata } = this._row(id)
@@ -151,6 +157,7 @@ export class NativeBudget {
     })
   }
   expire() {
+    this._restore()
     return this.store.transaction(() => {
       const at = this._now(), rows = this.store.db.prepare("SELECT id,metadata_json FROM actions WHERE kind='model.reservation' AND status IN ('reserved','running')").all()
       const ids = rows.filter(row => metadataOf(row).reservation_open && metadataOf(row).lease_until <= at).map(row => row.id)

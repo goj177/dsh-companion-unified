@@ -1,4 +1,5 @@
 /** Native private/live inbox primitives. Source messages stay separate from public publication receipts. */
+import {accountSourceUid,publicSourceContext,structuredMentionUids} from './source-context.mjs'
 import {createHash} from 'node:crypto'
 import {inflateSync,brotliDecompressSync} from 'node:zlib'
 import {BilibiliError,biliId,exactJson,cleanSourceText} from './bilibili-http.mjs'
@@ -23,10 +24,16 @@ export function livePacket(operation,body=''){
   const payload=Buffer.from(body),header=Buffer.alloc(16);header.writeUInt32BE(16+payload.length,0);header.writeUInt16BE(16,4);header.writeUInt16BE(1,6);header.writeUInt32BE(operation,8);header.writeUInt32BE(1,12);return Buffer.concat([header,payload])
 }
 function sourceTime(raw){const value=String(raw??'');if(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)){const at=Date.parse(value.replace(' ','T')+'+08:00');if(Number.isSafeInteger(at))return{source_at:at,source_time_raw:value}}return{source_at:null,source_time_raw:value}}
+function liveTargets(row,extra){
+  let details={};if(typeof extra==='string')try{details=exactJson(extra)}catch{}else if(extra&&typeof extra==='object')details=extra
+  const mentioned=structuredMentionUids([...(Array.isArray(row.mention_uids)?row.mention_uids:[]),...(Array.isArray(row.at_uids)?row.at_uids:[]),...(Array.isArray(row.at_users)?row.at_users:[]),...(Array.isArray(details.mention_uids)?details.mention_uids:[]),...(Array.isArray(details.at_uids)?details.at_uids:[]),...(Array.isArray(details.at_users)?details.at_users:[])])
+  let reply_to_uid='';try{if(row.reply_uid??row.reply_mid??details.reply_uid??details.reply_mid)reply_to_uid=biliId(row.reply_uid??row.reply_mid??details.reply_uid??details.reply_mid)}catch{}
+  return {mention_uids:mentioned,reply_to_uid}
+}
 export function normalizeLiveMessage(row,{websocket=false}={}){
-  if(websocket){if(!String(row.cmd??'').startsWith('DANMU_MSG')||!Array.isArray(row.info))return null;const info=row.info,raw=info[0]?.[4],sec=typeof raw==='number'&&Number.isSafeInteger(raw)&&raw>=0&&raw<8640000000000?raw:null,uid=biliId(info[2]?.[0]),text=safeText(String(info[1]??'')),name=cleanSourceText(info[2]?.[1],200),id=info[9]?.dmid??info[0]?.[9]?.dmid,source_at=sec===null?null:sec*1000,fingerprint='observation:'+hash(JSON.stringify([uid,source_at??String(raw??''),text]));return {key:id!==undefined?biliId(id):fingerprint,fingerprint,server_id:id!==undefined?biliId(id):'',uid,name,text,source_at,source_time_raw:String(raw??'')}}
+  if(websocket){if(!String(row.cmd??'').startsWith('DANMU_MSG')||!Array.isArray(row.info))return null;const info=row.info,raw=info[0]?.[4],sec=typeof raw==='number'&&Number.isSafeInteger(raw)&&raw>=0&&raw<8640000000000?raw:null,uid=biliId(info[2]?.[0]),text=safeText(String(info[1]??'')),name=cleanSourceText(info[2]?.[1],200),id=info[9]?.dmid??info[0]?.[9]?.dmid,source_at=sec===null?null:sec*1000,fingerprint='observation:'+hash(JSON.stringify([uid,source_at??String(raw??''),text]));return {...liveTargets(row,info[0]?.[15]?.extra),key:id!==undefined?biliId(id):fingerprint,fingerprint,server_id:id!==undefined?biliId(id):'',uid,name,text,source_at,source_time_raw:String(raw??'')}}
   const uid=biliId(row.uid),text=safeText(String(row.text??'')),server_id=row.id_str!==undefined&&/^\d+$/.test(String(row.id_str))?biliId(row.id_str):'',time=sourceTime(row.timeline)
-  const fingerprint='observation:'+hash(JSON.stringify([uid,time.source_at??time.source_time_raw,text]));return {key:server_id||fingerprint,fingerprint,server_id,uid,name:cleanSourceText(row.nickname,200),text,...time}
+  const fingerprint='observation:'+hash(JSON.stringify([uid,time.source_at??time.source_time_raw,text]));return {...liveTargets(row,row.extra),key:server_id||fingerprint,fingerprint,server_id,uid,name:cleanSourceText(row.nickname,200),text,...time}
 }
 export function ownerUids(service){const owner=service._settings().config.sharing?.owner_entity_id;return service.store.listPlatformIdentities({namespace:'bilibili',role:'owner',...(owner?{entity_id:owner}:{}),limit:100}).map(row=>row.platform_uid)}
 export async function readDirectHistory(service,{talker_uid,checkpoint,max_pages=10}={}){
@@ -63,7 +70,7 @@ export async function liveRoom(service,room_id){room_id=biliId(room_id);const ma
 export async function liveHistory(service,{room_id,limit=20}={}){if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw new BilibiliError('直播历史数量无效',{code:'invalid_input'});const room=await liveRoom(service,room_id),{data}=await service._get('/xlive/web-room/v1/dM/gethistory',{roomid:room.room_id,room_type:0},{host:LIVE});return {...room,items:(data.room??[]).map(row=>normalizeLiveMessage(row)).slice(-limit)}}
 export function shouldQueueLive(service,message,policy,room,state){
   if((policy.live_ignore_uids??[]).includes(message.uid)||service.store.listPlatformIdentities({namespace:'bilibili',role:'account',limit:100}).some(row=>row.platform_uid===message.uid))return false
-  const owners=ownerUids(service),names=typeof service.selfNames==='function'?service.selfNames():[],account=service.store.listPlatformIdentities({namespace:'bilibili',role:'account',limit:100}).map(row=>row.display_name).filter(Boolean),mentioned=[...names,...account].some(name=>typeof name==='string'&&name&&message.text.includes('@'+name)),scope=policy.live_scope??'owner'
+  const owners=ownerUids(service),self=accountSourceUid(service.store,'bilibili',service._settings().value.account_entity_id),mentioned=!!self&&((message.mention_uids??[]).includes(self)||message.reply_to_uid===self),scope=policy.live_scope??'owner'
   const authorized=scope==='owner'?owners.includes(message.uid):scope==='mention'?mentioned:scope==='all';if(!authorized)return false
   // Only obvious promotional loops are suppressed; ordinary emojis and casual human lines remain valid.
   if(!owners.includes(message.uid)&&!mentioned&&/^(?:欢迎.{1,40}(?:直播间|等你好久)|感谢.{1,40}(?:礼物|盲盒|舰长)|喜欢主播.{0,30}关注|谢谢.{0,30}(?:关注|礼物))/.test(message.text))return false
@@ -73,7 +80,7 @@ export async function handleLiveMessage(service,message,{room,policy,state,seed=
   if(!message||!policy.enabled||!policy.channels?.includes('live'))return {queued:0};const checkpoint=state.value.live_rooms.find(row=>row.room_id===room.room_id)??{room_id:room.room_id,baseline:false,seen_keys:[],recent_texts:[],last_polled_at:null}
   if(checkpoint.seen_keys.includes(message.key)||message.fingerprint&&checkpoint.seen_keys.includes(message.fingerprint))return{queued:0}
   let queued=0
-  if(!seed&&shouldQueueLive(service,message,policy,room,checkpoint)){const delivery=await service._incoming({channel:'live',key:message.key,uid:message.uid,name:message.name,body:message.text,conversation_id:'live:'+room.room_id,source_at:message.source_at,source_time_raw:message.source_time_raw,target:{channel:'live',room_id:room.room_id,reply_uid:message.uid,...(message.server_id?{reply_dmid:message.server_id}:{})},visibility:'public'});queued=delivery?.duplicate===true?0:1;checkpoint.recent_texts.push({uid:message.uid,text_sha256:hash(message.text),seen_at:service._now()})}
+  if(!seed&&shouldQueueLive(service,message,policy,room,checkpoint)){const delivery=await service._incoming({channel:'live',key:message.key,uid:message.uid,name:message.name,body:message.text,context_text:JSON.stringify({source_context:publicSourceContext({platform:'bilibili',source_kind:'live_comment',self_uid:accountSourceUid(service.store,'bilibili',service._settings().value.account_entity_id),author_uid:message.uid,reply_to_uid:message.reply_to_uid,mentioned_uids:message.mention_uids,text:message.text})}),conversation_id:'live:'+room.room_id,source_at:message.source_at,source_time_raw:message.source_time_raw,target:{channel:'live',room_id:room.room_id,reply_uid:message.uid,...(message.server_id?{reply_dmid:message.server_id}:{})},visibility:'public'});queued=delivery?.duplicate===true?0:1;checkpoint.recent_texts.push({uid:message.uid,text_sha256:hash(message.text),seen_at:service._now()})}
   checkpoint.baseline=true;checkpoint.seen_keys=[...new Set([...checkpoint.seen_keys,message.key,...(message.fingerprint?[message.fingerprint]:[])])].slice(-2000);checkpoint.recent_texts=checkpoint.recent_texts.filter(row=>service._now()-row.seen_at<3600000).slice(-100);checkpoint.last_polled_at=service._now();state.value.live_rooms=state.value.live_rooms.filter(row=>row.room_id!==room.room_id).concat(checkpoint);service._saveInboxState(state)
   return {queued}
 }

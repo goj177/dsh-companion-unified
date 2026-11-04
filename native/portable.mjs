@@ -7,6 +7,7 @@ import {NativeStore,NATIVE_DDL,NATIVE_TABLES,countOpenNativeStores} from './stor
 import {NativeAssets,nativeResourceFiles} from './assets.mjs'
 import {NativeSecrets} from './secrets.mjs'
 import {NativeBudget} from './budget.mjs'
+import {NativeHormone} from './hormone.mjs'
 import {NATIVE_FORMAT,NATIVE_SCHEMA_VERSION,NATIVE_APPLICATION_ID,isPlainObject,validateJson,validateDocument,validatePersona,stringifyJson} from './contracts.mjs'
 import {makeNativeZip,readNativeZip,ZIP_LIMITS,safeZipName} from './zip.mjs'
 import {validateModerationStateProof} from './qq-moderation.mjs'
@@ -129,6 +130,7 @@ function recoverRuntime(store,{now,restore_id}){
       store.db.prepare('UPDATE actions SET status=?,approval_token=?,updated_at=?,metadata_json=? WHERE id=?').run(status,active?'':row.approval_token,now,stringifyJson(next),row.id)
       if(active&&!openModel){if(processOnly)report.archived_process_leases++;else report.unknown_actions++}
     }
+    if(store.getDocument('hormone-state')?.value.rounds?.length)report.hormone_rounds=new NativeHormone({store,now:()=>now}).settlePending({key:'portable:'+restore_id}).settled
     report.cache_entries=store.db.prepare('SELECT count(*) AS n FROM cache_entries').get().n;store.db.prepare('DELETE FROM cache_entries').run()
     store.appendJournalEvent({event_key:'portable:'+restore_id+':completed',event_type:'log',platform:'system',direction:'internal',status:'recorded',visibility:'owner',text:'原生资料已完成离线恢复整理；未确认执行归档，未重放请求或虚构退款。',source_at:now,source_type:'native_portable_restore',recorded_at:now,metadata:{restore_id,...report,queued_and_draft_preserved:true}})
   })

@@ -6,6 +6,7 @@ import {NativeStore} from './store.mjs'
 import {isPlainObject,stringifyJson} from './contracts.mjs'
 import {shanghaiTime,valleyDecision} from '../policy.mjs'
 import calendar from '../holidays-2026.json' with {type:'json'}
+import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
 
 export const MONEY_PRICING_VERSION='deepseek-cny-20261029'
 export const CNY_NANO=1000000000
@@ -59,7 +60,8 @@ export function moneyRequestBound(request,rates){
 
 export class NativeMoneyBudget{
   constructor({store,now=Date.now}={}){if(!(store instanceof NativeStore)||typeof now!=='function')throw new Error('费用预算需要原生存储');this.store=store;this.now=now;this.live=new Set();this.latest=new Map();this.positions=new Map();this.denials=new Map()}
-  _policy(){const id=this.store.getDocument('settings')?.value.activity_document_id??'activity';return this.store.getDocument(id)?.value.budget??{}}
+  _policy(){const id=this.store.getDocument('settings')?.value.activity_document_id??'activity';return effectiveActivityPolicy({store:this.store,document_id:id,now:this.now}).budget??{}}
+  _restore(){if(!this.store.readOnly)restoreExpiredBudgetOverrides({store:this.store,now:this.now})}
   enabled(){return this._policy().money_budget_enabled===true}
   _rows(day){return this.store.db.prepare("SELECT * FROM actions WHERE kind='model.money' AND json_extract(metadata_json,'$.day')=?").all(day)}
   status({day=shanghaiTime(this.now()).date}={}){
@@ -69,12 +71,14 @@ export class NativeMoneyBudget{
     return {enabled:p.money_budget_enabled===true,scope:'all_companion_and_qq',day,currency:'CNY',limit_nano:limit,known_nano:known,uncertain_nano:uncertain,reserved_nano:reserved,counted_nano:total,remaining_nano:Math.max(0,limit-total),pricing_version:MONEY_PRICING_VERSION,model_calls:0}
   }
   _row(id){const row=this.store.db.prepare("SELECT * FROM actions WHERE id=? AND kind='model.money'").get(id);if(!row)throw new Error('费用预留不存在');return {row,value:metadata(row)}}
-  _write(id,value,status){this.store.db.prepare('UPDATE actions SET status=?,updated_at=?,metadata_json=? WHERE id=?').run(status,this.now(),stringifyJson(value),id)}
+  _write(id,value,status){this._restore();this.store.db.prepare('UPDATE actions SET status=?,updated_at=?,metadata_json=? WHERE id=?').run(status,this.now(),stringifyJson(value),id)}
   recover(){
+    this._restore()
     const rows=this.store.db.prepare("SELECT * FROM actions WHERE kind='model.money' AND json_extract(metadata_json,'$.reservation_open')=1").all()
     for(const row of rows){const m=metadata(row);if(!this.live.has(row.id)&&m.lease_until<=this.now())this._write(row.id,{...m,reservation_open:false,charged_nano:m.started?Math.max(m.charged_nano,m.reserved_nano):0,usage_known:false,recovered_unknown:true},m.started?'unknown':'cancelled')}
   }
   reserve(request,{scope='qq',platform='qq'}={}){
+    this._restore()
     if(!this.enabled())return null
     if(!['deepseek-account','deepseek'].includes(request.provider)||!moneyRates(request.model))throw new MoneyBudgetError('当前模型单价尚未核验，费用预算已阻止新调用','unknown_model')
     return this.store.transaction(()=>{
@@ -96,6 +100,7 @@ export class NativeMoneyBudget{
   }
   denial(session_id){return this.denials.get(session_id)??null}
   async *stream(request,next,{scope='qq',platform='qq',through}={}){
+    this._restore()
     if(!this.enabled()){yield* (through?through(next):next());return}
     let id,complete=false
     try{
@@ -111,6 +116,7 @@ export class NativeMoneyBudget{
     finally{this.finish(id,{completed:complete})}
   }
   importUsage({key,session_id,platform,at,model,provider='deepseek-account',usage,uncertain_tokens=0}){
+    this._restore()
     const rates=moneyRates(model,billingPhase(at).peak);if(!rates||!valid(at)||typeof key!=='string')throw new Error('历史费用来源无效')
     const priced=moneyUsageCost(usage,rates),nano=priced?.nano??uncertain_tokens*moneyRates(model,true).output;if(!valid(nano))throw new Error('历史费用用量无效')
     const id='money:import:'+hash(key),day=shanghaiTime(at).date,value={schema_version:1,record_type:'money_reservation',day,scope:'historical_companion',platform,session_id,provider,model,pricing_version:MONEY_PRICING_VERSION,rates,reserved_nano:0,charged_nano:nano,known_nano:priced?.nano??0,reservation_open:false,usage_known:!!priced,started:true,lease_until:0,started_at:at,import_key:key,...(priced?{last_usage:priced.usage}:{uncertain_tokens})}

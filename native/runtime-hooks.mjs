@@ -4,6 +4,8 @@ import { NativeMemoryRuntime } from './memory-runtime.mjs'
 import { isPlainObject,stringifyJson } from './contracts.mjs'
 import { valleyDecision } from '../policy.mjs'
 import {nativeReadParameters,nativeReadDescription} from './read-contracts.mjs'
+import {NATIVE_SOURCE_CONTEXT_GUIDE} from './source-context.mjs'
+import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
 
 const installed=new WeakMap()
 const sidOf=value=>value?.agent?.session?.header?.id??value?.agent?.session?.id??value?.session?.header?.id??value?.session?.id??value?.header?.id??value?.id??''
@@ -16,12 +18,11 @@ const memoryOnly=new Set([...maintenanceRead,'memory_remember'])
 const qqAnswers=new Set([...maintenanceRead,'qq_read_asset','memory_remember','memory_update','companion_learning','companion_mood','companion_diary','companion_expression','qq_send_image','qq_send_voice','qq_send_video','qq_send_forward'])
 const optional=(port,method,...args)=>typeof port?.[method]==='function'?port[method](...args):undefined
 const short=(value,limit)=>{if(value===undefined||value===null)return '';if(typeof value!=='string')throw new Error('原生上下文callback必须同步返回文本');return value.length<=limit?value:''}
-
 /** Native services only. The caller registers publication/social tools; these
  * hooks bind real SDK sources, apply monotonic execution guards and assemble
  * stable persona plus a small task-related context. */
 export function installNativeRuntimeHooks(ctx,options={}){
-  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','speech','references','learning','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','now','register_memory_tools','register_profile_tool','register_image_tool'])
+  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','affect','speech','references','learning','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','now','register_memory_tools','register_profile_tool','register_image_tool'])
   const {store,profiles,memory_runtime:memory,qq,session_runner:runner}=options
   if(!(store instanceof NativeStore)||!(profiles instanceof NativeProfileService)||!(memory instanceof NativeMemoryRuntime)||profiles.store!==store||memory.store!==store)throw new Error('运行钩子必须使用同一NativeStore的原生人设和记忆服务')
   if(options.host_context_resolver!==undefined&&typeof options.host_context_resolver!=='function')throw new Error('host_context_resolver必须为可信宿主函数')
@@ -31,6 +32,8 @@ export function installNativeRuntimeHooks(ctx,options={}){
   const now=options.now??store.now,disposers=[],oldResolver=memory.context_resolver,hostContexts=new Map()
   let warned=false
   const warn=()=>{if(!warned){warned=true;try{ctx.logger?.warn?.('原生上下文有一项暂不可用；未重放任务或发送。')}catch{}}}
+  const affect=(method,...args)=>{try{return optional(options.affect,method,...args)}catch{warn();return undefined}}
+  const learning=(method,...args)=>{try{return optional(options.learning,method,...args)}catch{warn();return undefined}}
   const context=(exec,binding)=>{
     const sid=sidOf(exec),task=runner?.context(sid)
     if(task)return pickContext(task)
@@ -45,22 +48,25 @@ export function installNativeRuntimeHooks(ctx,options={}){
   const platform=agent=>{const resolved=context({agent}),value=options.persona_resolver?.(agent,resolved)
     if(value!==undefined&&value!==null){if(!['main','qq','tieba','bilibili'].includes(value))throw new Error('人格舞台必须由可信工作区绑定提供');return value}
     return ['qq','tieba','bilibili'].includes(resolved.platform)?resolved.platform:'main'}
-  const policy=()=>store.getDocument('activity')?.value??{enabled:false}
+  const policy=()=>effectiveActivityPolicy({store,now})
   const metadata=agent=>({agent,context:context({agent}),platform:platform(agent)})
+  const sourceReview=agent=>runner?.task(sidOf(agent))?.maintenance_kind==='learning'
   const section=spec=>{const off=ctx.systemPrompt.section(spec);if(typeof off==='function')disposers.push(off)}
-  section({name:'companion:persona',order:120,text:({agent}={})=>context({agent}).memory_only?'':profiles.render(platform(agent))})
-  if(options.speech?.section)section({name:'companion:speech',order:130,text:({agent}={})=>context({agent}).memory_only?'':short(options.speech.section(metadata(agent)),500)})
+  section({name:'companion:persona',order:120,text:({agent}={})=>context({agent}).memory_only||sourceReview(agent)?'':profiles.render(platform(agent))})
+  if(options.speech?.section)section({name:'companion:speech',order:130,text:({agent}={})=>context({agent}).memory_only||sourceReview(agent)?'':short(options.speech.section(metadata(agent)),500)})
+  section({name:'companion:source-context',order:135,text:({agent}={})=>context({agent}).memory_only||runner?.task(sidOf(agent))?'':NATIVE_SOURCE_CONTEXT_GUIDE})
   section({name:'companion:memory-guide',order:140,text:()=>memory.guide()})
   const offContext=ctx.systemPrompt.context({name:'companion:native-context',order:950,required:true,text:({agent}={})=>{
     try{
       const resolved=context({agent}),input={agent,context:resolved,platform:platform(agent)},lines=[]
-      if(!resolved.memory_only){
+      if(runner?.task(sidOf(agent))?.study_closing)lines.push('【本轮收尾】本轮已取得11帖真实阅读来源，并已有原生发表动作。现在只用一句简短自然的话结束，不再浏览、学习或调用工具。已准备动作仍走原发表队列；未确认的动作不能声称已发表。')
+      if(!resolved.memory_only&&!sourceReview(agent)){
         if(options.people?.context){const familiar=Object.fromEntries(['session_id','workspace_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','read_memory'].filter(key=>resolved[key]!==undefined).map(key=>[key,resolved[key]]));familiar.public_summary_enabled=store.getDocument('settings')?.value.familiarity?.public_summary_enabled===true;lines.push(short(options.people.context(familiar),180))}
-        lines.push(short(optional(options.mood,'context',input),120),short(optional(options.references,'context',input),360),short(optional(options.speech,'context',input),120),short(optional(options.learning,'context',input),400),short(optional(options.social,'context',input),260))
+        lines.push(short(affect('context',input)??optional(options.mood,'context',input),240),short(optional(options.references,'context',input),360),short(optional(options.speech,'context',input),120),short(learning('context',input),1000),short(optional(options.social,'context',input),260))
       }
-      if(runner?.task(sidOf(agent)))lines.push(resolved.memory_only?'【当前任务】仅整理给定少量证据；推断待确认，不联系任何人。':'【当前活动】只做本轮相关的一件事；开口接具体内容，不写内部工作报告。')
+      if(runner?.task(sidOf(agent)))lines.push(resolved.memory_only?'【当前任务】仅整理给定少量证据；推断待确认，不联系任何人。':sourceReview(agent)?'【当前任务】按原始来源归纳用法与场景，不把自己的口头禅或人设套成各吧的表达；没有新收获就跳过。':'【当前活动】只做本轮相关的一件事；开口接具体内容，不写内部工作报告。')
       const complete=[];let used=0
-      for(const line of lines.filter(Boolean)){if(used+line.length+(complete.length?1:0)>1400)continue;used+=line.length+(complete.length?1:0);complete.push(line)}
+      for(const line of lines.filter(Boolean)){if(used+line.length+(complete.length?1:0)>2300)continue;used+=line.length+(complete.length?1:0);complete.push(line)}
       return complete.join('\n')
     }catch{warn();return ''}
   }})
@@ -81,10 +87,11 @@ export function installNativeRuntimeHooks(ctx,options={}){
   const allowed=(agent)=>{
     const resolved=context({agent}),task=runner?.task(sidOf(agent))
     if(!task)return null
+    if(task.study_closing)return new Set()
     if(resolved.memory_only)return memoryOnly
-    if(task.batch.tasks.some(row=>row.target?.no_publication===true))return new Set([...memoryOnly,'companion_persona','companion_expression','companion_read','companion_image','companion_diary','companion_learning','companion_speech'])
     if(task.maintenance_kind==='mood')return new Set([...maintenanceRead,'companion_mood'])
     if(task.maintenance_kind==='learning')return new Set([...maintenanceRead,'companion_learning'])
+    if(task.batch.tasks.some(row=>row.target?.no_publication===true))return new Set([...memoryOnly,'companion_persona','companion_expression','companion_read','companion_image','companion_diary','companion_learning','companion_speech'])
     const names=optional(options.social,'allowed_tool_names',{agent,context:resolved,platform:resolved.platform})??[]
     if(!Array.isArray(names)||names.some(name=>typeof name!=='string'))throw new Error('社交能力必须显式提供工具名列表')
     return new Set([...memoryOnly,'companion_persona','companion_expression','companion_learning','qq_read_asset',...names])
@@ -99,7 +106,7 @@ export function installNativeRuntimeHooks(ctx,options={}){
       if(options.qq_moderation_lookup_authority?.(exec)===true)return
       if(exec.name==='companion_action'&&['qq.mute','qq.unmute'].includes(exec.arguments?.kind)&&options.qq_moderation_authority?.(exec)===true)return
       if(!qqAnswers.has(exec.name))return '当前QQ来源仅可问答，不能操作主机、账号或其他平台。'
-      if(exec.name==='companion_learning'&&!['status','feedback'].includes(exec.arguments?.operation))return '当前QQ成员仅可读取学习状态或提交本人本轮真实反馈，不能提案或回滚。'
+      if(exec.name==='companion_learning'&&!['status','sources','learn','feedback'].includes(exec.arguments?.operation))return '当前QQ成员仅可同域教学或提交本人真实反馈，不能提案全局行为或回滚。'
       if(exec.name==='companion_diary'&&exec.arguments?.operation==='write'&&(exec.arguments?.kind??'private')!=='private')return '普通QQ成员只记录同域私密日记，不能写公开日记。'
       const destination=exec.arguments?.conversation_id
       if(exec.name.startsWith('qq_send_')&&destination!==undefined&&destination!==chat)return 'QQ问答媒体只能回到本轮来源会话。'
@@ -107,8 +114,15 @@ export function installNativeRuntimeHooks(ctx,options={}){
   })
   if(typeof guard==='function')disposers.push(guard)
   const on=(name,fn)=>{const off=ctx.on(name,fn);if(typeof off==='function')disposers.push(off)}
-  on('system-prompt/assemble',async(_assembly,input,next)=>{const assembly=await next(),names=allowed(input?.agent);if(!names)return assembly;const stage=platform(input?.agent);return{...assembly,tools:assembly.tools.filter(tool=>names.has(tool.name)).map(tool=>tool.name==='companion_read'?{...tool,description:nativeReadDescription(stage),parameters:nativeReadParameters(stage)}:tool.name==='companion_persona'?{...tool,parameters:{...tool.parameters,properties:{platform:{type:'string',enum:[stage]}}}}:tool)}})
+  on('system-prompt/assemble',async(_assembly,input,next)=>{
+    const task=runner?.task(sidOf(input?.agent))
+    // The official loop assembles before pre-step admission. onRequest keeps
+    // the last real position; only a later, already-bound step may close.
+    if(task?.input_bound&&task.user_committed&&Number.isSafeInteger(task.step)&&task.step>0)runner?.studyClosing?.(input.agent,{turn:task.turn,step:task.step+1})
+    const assembly=await next(),names=allowed(input?.agent);if(!names)return assembly;const stage=platform(input?.agent);return{...assembly,tools:assembly.tools.filter(tool=>names.has(tool.name)).map(tool=>tool.name==='companion_read'?{...tool,description:nativeReadDescription(stage),parameters:nativeReadParameters(stage)}:tool.name==='companion_persona'?{...tool,parameters:{...tool.parameters,properties:{platform:{type:'string',enum:[stage]}}}}:tool)}
+  })
   on('agent/pre-step',async(payload,next)=>{
+    if(!store.readOnly)restoreExpiredBudgetOverrides({store,now})
     const {agent,messages=[],turn,step,signal}=payload
     qq?.admitMessages(agent,messages)
     const sid=sidOf(agent)
@@ -127,27 +141,40 @@ export function installNativeRuntimeHooks(ctx,options={}){
     }
     const decision=await next()
     if(decision?.kind!=='enter'||signal?.aborted)return decision
+    affect('admit',agent,decision.messages??messages,{context:context({agent}),task:runner?.task(sid),memory,qq,turn})
+    learning('admit',agent,decision.messages??messages,{context:context({agent}),task:runner?.task(sid),memory,qq,turn})
     return memory.beforeFetch(agent,decision)
   })
   on('agent/request',async(payload,next)=>{
     runner?.onRequest(payload.agent,payload);options.money_budget?.onRequest(payload)
+    affect('request',payload.agent,payload)
     const request=await next(),task=runner?.task(sidOf(payload.agent)),resolved=context({agent:payload.agent}),p=policy()
     if(!task&&!['qq','tieba','bilibili'].includes(resolved.platform))return options.money_budget?.enabled()?{...request,maxTokens:Math.min(request.maxTokens??32768,32768)}:request
     const peak=!valleyDecision(now(),p).valley,output=resolved.memory_only?1200:task?.batch.model?.max_output_tokens??(peak?p.model?.peak_max_output_tokens??900:p.model?.max_output_tokens??1800)
-    return {...request,reasoningEffort:task?.batch.model?.reasoning_effort??p.model?.reasoning_effort??'low',maxTokens:Math.min(request.maxTokens??Infinity,output)}
+    const closing=task?.study_closing===true
+    return {...request,reasoningEffort:task?.batch.model?.reasoning_effort??p.model?.reasoning_effort??'low',maxTokens:Math.min(request.maxTokens??Infinity,output,closing?768:Infinity)}
   })
   on('llm/stream',(request,next)=>{
+    if(!store.readOnly)restoreExpiredBudgetOverrides({store,now})
     const task=runner?.task(request?.sessionId),chat=qq?.chatForSession(request?.sessionId)
-    if(!task&&!chat&&!options.money_budget?.enabled())return next()
-    return (async function*(){const sdk=await runner.controller.sdk(),through=task?(start=>runner.stream(request,start,{is_loop_request:sdk.isAgentLoopRequest(request)})):undefined,money=options.money_budget
+    const invoke=()=>!task&&!chat&&!options.money_budget?.enabled()?next():(async function*(){const sdk=await runner.controller.sdk(),through=task?(start=>runner.stream(request,start,{is_loop_request:sdk.isAgentLoopRequest(request)})):undefined,money=options.money_budget
       if(money)yield* money.stream(request,next,{scope:task?'activity':chat?'qq':'harness',platform:task?.batch.platform??(chat?'qq':'harness'),through});else yield* (through?through(next):next())
+    })()
+    if(!options.affect&&!options.learning?.stream)return invoke()
+    return (async function*(){
+      let loop=false;try{const sdk=await runner?.controller?.sdk?.();loop=sdk?.isAgentLoopRequest?.(request)===true}catch{warn()}
+      const learned=()=>loop?learning('stream',request,invoke,{is_loop_request:true})??invoke():invoke()
+      yield* (loop?affect('stream',request,learned,{context:context({agent:{session:{id:request?.sessionId}}}),is_loop_request:true})??learned():invoke())
     })()
   })
   on('session/event',(session,event)=>{
     try{
+      const boundContext=context({agent:{session}}),boundTask=runner?.task(sidOf(session))
+      affect('onEvent',session,event,{context:boundContext,task:boundTask})
       options.money_budget?.onEvent(session,event)
       if(event.type==='turn/start')hostContexts.delete(sidOf(session))
       memory.ingestSessionEvent(session,event)
+      learning('onEvent',session,event,{context:boundContext,task:boundTask})
       if(event.type==='turn/end'){
         Promise.resolve(qq?.onSessionEvent(session,event)).catch(warn).finally(()=>runner?.onSessionEvent(session,event))
       }else{

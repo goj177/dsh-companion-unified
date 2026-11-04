@@ -137,9 +137,13 @@ export function uncertain(value) { return UNCERTAIN.test(value) }
 export function classifyEvidence({direction,source_type,kind,text,source,receipt}) {
   if (FAILED.has(String(receipt.status??'').toLowerCase()) || receipt.ok===false || receipt.sent===false || receipt.success===false) return {status:FAILED.has(receipt.status)?receipt.status:'failed',confirmation:'none',priority:0}
   if (source_type==='server_action' && positiveReceipt(receipt)) return {status:'confirmed',confirmation:'server_receipt',priority:90}
-  if (source.uncertain===true || uncertain(text) || source_type==='model' || source.kind==='inference') return {status:'uncertain',confirmation:'none',priority:0}
-  if (source_type==='user' && direction==='in' && ['user','human','user_statement'].includes(source.kind) && (source.explicit===true || source.kind==='user_statement' || ['statement','user_statement'].includes(kind))) return {status:'confirmed',confirmation:'user_statement',priority:80}
+  if (source.uncertain===true || source_type==='model' || source.kind==='inference') return {status:'uncertain',confirmation:'none',priority:0}
+  // A quoted "maybe" describes the source's claim, not whether the native
+  // reader actually received these bytes. Confirm the read only; its body is
+  // still labelled as an unverified account and cannot prove own experience.
   if (source_type==='platform' && ['in','observation'].includes(direction) && source.kind==='platform_read' && source.explicit===true) return {status:'confirmed',confirmation:'source_observation',priority:75}
+  if (uncertain(text)) return {status:'uncertain',confirmation:'none',priority:0}
+  if (source_type==='user' && direction==='in' && ['user','human','user_statement'].includes(source.kind) && (source.explicit===true || source.kind==='user_statement' || ['statement','user_statement'].includes(kind))) return {status:'confirmed',confirmation:'user_statement',priority:80}
   return {status:'pending',confirmation:'none',priority:0}
 }
 /** Runtime authority comes from the canonical immutable source category, never

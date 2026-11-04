@@ -105,6 +105,24 @@ const mood = object({
     last_noted_value: nullable(number(0,100)), minor: boolean, kind: string(160) }),
 }, ['enabled'])
 
+const hormoneValues=object({stress:number(0,100),energy:number(0,100),reward:number(0,100),boredom:number(0,100)},['stress','energy','reward','boredom'])
+const hormone=object({enabled:boolean,mode:choice('active','observe'),policy:object({
+  daily_token_budget:integer(1,1000000000),rest_after_minutes:number(0.01,10000),recovery_half_hours:number(0.01,10000),
+  day_energy_baseline:number(0,100),night_energy_baseline:number(0,100),night_start_hour:hour,night_end_hour:hour,daily_recovery:number(0,100),
+  stress_half_hours:number(0.01,10000),reward_half_minutes:number(0.01,10000),boredom_after_minutes:number(0.01,10000),boredom_half_hours:number(0.01,10000),
+  debt_ratio:number(0,10),debt_max:number(0,80),debt_decay_hours:number(0.01,10000),
+  stress_cost:number(0,3),reward_cost:number(0,3),reward_stress_decay:number(0,0.95),stress_recovery:number(0,3),
+  stress_high:number(0,100),energy_low:number(0,100),reward_high:number(0,100),boredom_high:number(0,100),reminder_minutes:number(0.01,10000),
+})},['enabled','mode'])
+const hormoneHash=string(64,{pattern:/^[a-f0-9]{64}$/})
+const hormoneState=object({version:choice(1),updated_at:timestamp,day:date,last_work_at:timestamp,last_user_at:timestamp,values:hormoneValues,
+  debts:array(object({amount:number(0,80),at:timestamp},['amount','at']),400),
+  emit:object({active:array(choice('stress','energy','reward','boredom'),4),at:timestamp},['active','at']),
+  rounds:array(object({id:hormoneHash,session_hash:hormoneHash,turn:integer(),updated_at:timestamp,tokens:integer(),tool_count:integer(),error_count:integer(),consecutive_errors:integer(),
+    requests:array(object({id:hormoneHash,total_tokens:integer()},['id','total_tokens']),256)},['id','session_hash','turn','updated_at','tokens','tool_count','error_count','consecutive_errors','requests']),128),
+  history:array(object({at:timestamp,reason:string(80),platform,values:hormoneValues,debt:number(0,80)},['at','reason','platform','values','debt']),400),
+},['version','updated_at','day','last_work_at','last_user_at','values','debts','emit','rounds','history'])
+
 const qqSettings = object({
   transport: object({ mode: choice('forward','reverse'), url: string(4096), host: string(512), port: integer(0, 65535), credential_ref: identifier,
     connect_timeout_ms: integer(), reconnect_max_attempts: integer() }),
@@ -199,6 +217,28 @@ const learningState = object({
     evidence_ids: array(identifier, 100), source_at: timestamp, status: choice('proposed','challenged','rolled_back','accepted') }, ['id','kind','content','status']), 10000),
   versions: array(object({ revision: integer(), created_at: timestamp, suggestion_ids: array(identifier, 10000), restored_from: integer() }, ['revision','created_at']), 10000),
 }, ['revision','observations'])
+const learningLoop = object({enabled:boolean,policy:object({
+  max_cards:integer(1,1000),max_hint_chars:integer(0,2000),meme_cooldown_minutes:number(0,10000),recent_window_minutes:number(1,10000),
+  max_meme_uses_per_context:integer(1,100),trial_uses_required:integer(1,100),positive_feedback_required:integer(0,100),
+  review_interval_minutes:number(1,10000),review_sources_per_batch:integer(1,10),review_max_per_day:integer(0,100),
+  review_retry_minutes:number(1,10000),review_max_attempts:integer(1,100),
+})},['enabled'])
+const learningContent=object({label:string(40),meaning:string(240),cues:array(string(60),8),applies_to:array(string(80),6),avoid_in:array(string(80),6),
+  example_good:string(240),example_bad:string(240),source_quotes:array(object({evidence_id:string(160),quote:string(300)},['evidence_id','quote']),4),
+},['label','meaning','cues','applies_to','avoid_in','example_good','example_bad','source_quotes'])
+const learningItemStatus=choice('trial','active','paused','retired')
+const learningItem=object({id:string(80),kind:choice('meme','phrase','habit'),status:learningItemStatus,revision:integer(),content:learningContent,
+  evidence_ids:array(string(160),4),source_kind:choice('public_read','owner_teaching'),visibility:choice('public','owner','conversation'),platform,conversation_id:string(512),
+  created_at:timestamp,updated_at:timestamp,used:integer(),positive:integer(),negative:integer(),last_used_at:timestamp,last_offered_at:timestamp,
+  versions:array(object({revision:integer(),status:learningItemStatus,content:learningContent,evidence_ids:array(string(160),4),at:timestamp},['revision','status','content','evidence_ids','at']),8),
+},['id','kind','status','revision','content','evidence_ids','source_kind','visibility','platform','conversation_id','created_at','updated_at','used','positive','negative','last_used_at','last_offered_at','versions'])
+const learningHash=string(64,{pattern:/^[a-f0-9]{64}$/})
+const learningLoopState=object({version:choice(1),revision:integer(),updated_at:timestamp,
+  reviews:array(object({evidence_id:string(160),attempts:integer(),retry_after:timestamp,completed_at:timestamp,status:choice('queued','done','skipped','failed'),last_task_id:string(240)},['evidence_id','attempts','retry_after','completed_at','status','last_task_id']),3000),
+  offers:array(object({id:string(80),card_id:string(160),card_revision:integer(),context_hash:learningHash,session_hash:learningHash,platform,at:timestamp,query_hash:learningHash,task_id:string(240),source_scope:string(512)},['id','card_id','card_revision','context_hash','session_hash','platform','at','query_hash','task_id','source_scope']),200),
+  usages:array(object({id:string(80),card_id:string(160),card_revision:integer(),context_hash:learningHash,session_hash:learningHash,platform,at:timestamp,excerpt:string(120),source_ref:string(512),output_hash:learningHash,actor_uid:string(240)},['id','card_id','card_revision','context_hash','session_hash','platform','at','excerpt','source_ref','output_hash']),200),
+  blocks:array(object({card_id:string(160),context_hash:learningHash,at:timestamp},['card_id','context_hash','at']),200),
+},['version','revision','updated_at','reviews','offers','usages','blocks'])
 const speech = object({ enabled: boolean, level: choice('light','standard'), repetition_hints: boolean }, ['enabled'])
 const speechState = object({ version: integer(1), buckets: array(object({ id:string(64,{pattern:/^[a-f0-9]{64}$/}),
   platform:choice('main','qq','tieba','bilibili','harness'), kind:choice('session','qq-chat'), updated_at:timestamp,
@@ -232,6 +272,10 @@ const tiebaBarStyles = object({ platform: choice('tieba'), historical: boolean,
     mode: string(240), updated_at: nullable(timestamp), updated_time_raw: string(1000),
   }, ['bar','visits','samples','tags','mode','updated_at','updated_time_raw']), 1000),
 }, ['platform','historical','bars'])
+const tiebaAtmosphere=object({version:choice(1),bar:string(160,{nonempty:true}),updated_at:timestamp,
+  sources:array(object({evidence_id:identifier,thread_id:string(160,{nonempty:true}),read_at:timestamp,title:string(180),ref:string(4096)},['evidence_id','thread_id','read_at','title','ref']),24),
+  samples:array(object({id:string(160,{nonempty:true}),thread_id:string(160,{nonempty:true}),post_id:string(160,{nonempty:true}),author_uid:string(160,{nonempty:true}),text:string(1200,{nonempty:true}),evidence_id:identifier,observed_at:timestamp,scene:choice('help','discussion','banter','other')},['id','thread_id','post_id','author_uid','text','evidence_id','observed_at','scene']),60),
+},['version','bar','updated_at','sources','samples'])
 const personaReference = object({id:identifier,profile_id:identifier,platform:choice('main','qq','tieba','bilibili'),
   kind:choice('style_rule','scene_tactic','speech_example','meme','learning_observation'),status:choice('active','candidate','archived'),
   visibility:choice('owner','public'),usage:choice('style_reference_only'),title:string(1000),
@@ -248,10 +292,10 @@ const workspacePersonaBinding = object({workspace_id:string(512,{nonempty:true})
   ['workspace_id','platform','enabled'])
 
 export const DOCUMENT_CONTRACTS = freeze(Object.fromEntries(Object.entries({
-  settings, activity, activity_state: activityState, mood, platform_settings: providerSettings,
-  platform_state: platformState, quota, inbox, learning, learning_state: learningState, speech, speech_state:speechState,
+  settings, activity, activity_state: activityState, mood, hormone, hormone_state:hormoneState, platform_settings: providerSettings,
+  platform_state: platformState, quota, inbox, learning, learning_state: learningState, learning_loop:learningLoop,learning_loop_state:learningLoopState,learning_item:learningItem,speech, speech_state:speechState,
   traffic_state:trafficState, session_policy: sessionPolicy, conversation_binding: conversationBinding, bilibili_inbox_state:bilibiliInboxState,tieba_inbox_state:tiebaInboxState,tieba_reply_inbox_state:tiebaReplyInboxState,
-  tieba_style_library: tiebaStyleLibrary, tieba_bar_styles: tiebaBarStyles,
+  tieba_style_library: tiebaStyleLibrary, tieba_bar_styles: tiebaBarStyles,tieba_atmosphere:tiebaAtmosphere,
   persona_reference:personaReference,
   runtime_lease:runtimeLease,
   workspace_persona_binding:workspacePersonaBinding,

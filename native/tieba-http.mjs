@@ -18,6 +18,7 @@
  * This file is pure: no credentials, files, child processes, timers or network access.
  */
 import {createHash} from 'node:crypto'
+import {renderTiebaContentParts,renderTiebaReadText} from './tieba-content.mjs'
 export const TIEBA_HOST='https://tieba.baidu.com',TIEBA_APP='https://tiebac.baidu.com'
 export const TIEBA_UA='Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
 export class TiebaError extends Error{constructor(message,code='unavailable',details={}){super(message);this.name='TiebaError';this.code=code;Object.assign(this,details)}}
@@ -43,7 +44,7 @@ export function parsePcBar(data,bar){
 }
 export function parseThreadHtml(html){
   const floors=[],owners=[],images=[],seen=new Set(),re=/<div class=["']([^"']*content[^"']*)["'][^>]*>([\s\S]*?)<\/div>/g;let m
-  while((m=re.exec(html))){if(m[1].includes('top_bar'))continue;const body=decodeHtml(m[2]).trim();if(body){const before=html.slice(Math.max(0,m.index-4000),m.index),names=[...before.matchAll(/class=["']user_name[^"']*["'][^>]*>([\s\S]*?)<\//g)];floors.push(body);owners.push(decodeHtml(names.at(-1)?.[1]??'').replace(/[:：]\s*$/,''))}
+  while((m=re.exec(html))){if(m[1].includes('top_bar'))continue;const body=renderTiebaReadText(decodeHtml(m[2]).trim());if(body){const before=html.slice(Math.max(0,m.index-4000),m.index),names=[...before.matchAll(/class=["']user_name[^"']*["'][^>]*>([\s\S]*?)<\//g)];floors.push(body);owners.push(decodeHtml(names.at(-1)?.[1]??'').replace(/[:：]\s*$/,''))}
     for(const image of m[2].matchAll(/(?:data-src|src|data-url)=["']([^"']+)["']/g)){let value=image[1].replace(/&amp;/g,'&');if(value.startsWith('//'))value='https:'+value;if(!/^https:\/\//.test(value)||/editor\/images|image_emoticon/.test(value)||seen.has(value))continue;seen.add(value);images.push(value)}}
   return {title:decodeHtml(/<title[^>]*>([^<]+)/i.exec(html)?.[1]??''),bar:/"fname"\s*:\s*"([^"]+)"/.exec(html)?.[1]??'',floors,owners,images:images.slice(0,20),image_count:images.length}
 }
@@ -59,14 +60,24 @@ export function pbFields(input){
 }
 const small=value=>{if(value>BigInt(Number.MAX_SAFE_INTEGER))throw new TiebaError('平台计数超出精确范围','invalid_response');return Number(value)}
 const utf8=bytes=>{try{return new TextDecoder('utf-8',{fatal:true}).decode(bytes)}catch{throw new TiebaError('平台文字编码无法核验','invalid_response')}}
-const pbText=bytes=>pbFields(bytes).filter(row=>row.field===2&&row.bytes).map(row=>utf8(row.bytes)).join('')
+/** Official PbEmot renders type=2 through its emoticon component, not as text:
+ * https://tb3.bdstatic.com/tb/pc/pc-main-core/static/js/pb.b69f12af.js
+ * String field coordinates follow the linked PbContent protocol definition.
+ * Unknown fields stay typed/base64 metadata; c is not assumed to be a name. */
+export function parseTiebaContent(parts){
+  const input=Array.isArray(parts)?parts:[parts]
+  return renderTiebaContentParts(input.map(bytes=>{const rows=pbFields(bytes),type=rows.find(row=>row.field===1)?.value??0n,part={type:small(type),source_text:rows.filter(row=>row.field===2&&row.bytes).map(row=>utf8(row.bytes)).join(''),protocol_fields:rows.map(row=>({field:row.field,wire:row.wire,...(row.value!==undefined?{integer:row.value.toString()}:{base64:row.bytes.toString('base64')})}))}
+    for(const[name,field]of Object.entries({link:3,src:4,c:11})){const value=rows.find(row=>row.field===field)?.bytes;if(value)part[name]=utf8(value)}
+    for(const[name,field]of Object.entries({uid:15,is_native_app:22})){const value=rows.find(row=>row.field===field)?.value;if(value!==undefined)part[name]=value.toString()}
+    return part}))
+}
 const common=(bduss,version='22.12.1.0',tbs='')=>Buffer.concat([pbInt(1,2),pbString(2,version),pbString(10,bduss),...(tbs?[pbString(11,tbs)]:[])])
 export function encodePageRequest({thread_id,post_id,page=1,limit=30,sort=1,bduss=''}){return pbBytes(1,Buffer.concat([pbBytes(25,common(bduss,'12.64.1.1')),pbInt(4,tiebaId(thread_id)),...(post_id?[pbInt(7,tiebaId(post_id))]:[]),pbInt(5,0),pbInt(6,sort),pbInt(13,limit),pbInt(18,page),pbInt(8,0),pbInt(9,0),pbInt(74,1)]))}
 export function encodeSubRequest({thread_id,post_id,page=1,bduss=''}){return pbBytes(1,Buffer.concat([pbInt(1,tiebaId(thread_id)),pbInt(2,tiebaId(post_id)),pbInt(4,page),pbBytes(9,common(bduss))]))}
 function pbUser(bytes){const row={uid:'',name:'',name_show:'',portrait:''};for(const f of pbFields(bytes)){if(f.field===2&&f.value!==undefined)row.uid=f.value.toString();else if(f.bytes&&f.field===3)row.name=utf8(f.bytes);else if(f.bytes&&f.field===4)row.name_show=utf8(f.bytes);else if(f.bytes&&f.field===5)row.portrait=utf8(f.bytes)}if(!row.name_show)row.name_show=row.name;return row}
 export function encodeProfileRequest({portrait,bduss=''}){return pbBytes(1,Buffer.concat([pbInt(2,1),pbInt(15,1),pbString(16,portrait),pbBytes(9,common(bduss))]))}
 export function parseUserProfile(bytes){const fields=pbFields(bytes),error=fields.find(x=>x.field===1)?.bytes;if(error){const code=pbFields(error).find(x=>x.field===1)?.value??0n;if(code!==0n){const failure=new TiebaError('官方用户资料读取被拒绝','read_failed');failure.server_code=Number(code);throw failure}}const data=fields.find(x=>x.field===2)?.bytes,user=data&&pbFields(data).find(x=>x.field===1)?.bytes;if(!user)throw new TiebaError('官方用户资料缺少身份字段','invalid_response');return pbUser(user)}
-export function parsePagePosts(bytes){const rows=[];for(const top of pbFields(bytes))if(top.field===2&&top.bytes)for(const p of pbFields(top.bytes))if(p.field===6&&p.bytes){const row={post_id:'',floor:0,author_uid:'',likes:0,reply_count:0,source_at:0,text:''};for(const f of pbFields(p.bytes)){if(f.value!==undefined){if(f.field===1)row.post_id=f.value.toString();else if(f.field===3)row.floor=small(f.value);else if(f.field===4)row.source_at=small(f.value)*1000;else if(f.field===19)row.author_uid=f.value.toString();else if(f.field===13)row.reply_count=small(f.value)}else if(f.field===5&&f.bytes)row.text+=pbText(f.bytes);else if(f.field===37&&f.bytes)for(const a of pbFields(f.bytes))if(a.field===1&&a.value!==undefined)row.likes=small(a.value)}if(row.floor&&row.post_id)rows.push(row)}return rows}
+export function parsePagePosts(bytes){const rows=[];for(const top of pbFields(bytes))if(top.field===2&&top.bytes)for(const p of pbFields(top.bytes))if(p.field===6&&p.bytes){const row={post_id:'',floor:0,author_uid:'',likes:0,reply_count:0,source_at:0,text:''},parts=[];for(const f of pbFields(p.bytes)){if(f.value!==undefined){if(f.field===1)row.post_id=f.value.toString();else if(f.field===3)row.floor=small(f.value);else if(f.field===4)row.source_at=small(f.value)*1000;else if(f.field===19)row.author_uid=f.value.toString();else if(f.field===13)row.reply_count=small(f.value)}else if(f.field===5&&f.bytes)parts.push(f.bytes);else if(f.field===37&&f.bytes)for(const a of pbFields(f.bytes))if(a.field===1&&a.value!==undefined)row.likes=small(a.value)}if(row.floor&&row.post_id)rows.push({...row,...parseTiebaContent(parts)})}return rows}
 /** Pagination and forum identity from the same official PbPage response. */
 export function parsePostPage(bytes){
   const top=pbFields(bytes),data=top.find(row=>row.field===2)?.bytes,error=top.find(row=>row.field===1)?.bytes
@@ -76,9 +87,10 @@ export function parsePostPage(bytes){
   const number=field=>{const value=ints.find(row=>row.field===field)?.value;return value===undefined?null:small(value)},current_page=number(3),total_page=number(5)
   if(!current_page||!total_page||current_page>total_page||total_page>1000000)throw new TiebaError('官方分页坐标无法核验','invalid_response')
   const forum_id=forum?pbFields(forum).find(row=>row.field===1)?.value?.toString()??'':''
-  return {posts:parsePagePosts(bytes),forum_id,page:{current_page,total_page,total_count:number(4)},response_sha256:createHash('sha256').update(bytes).digest('hex')}
+  const thread=fields.find(row=>row.field===8)?.bytes,thread_id=thread?pbFields(thread).find(row=>row.field===1)?.value?.toString()??'':''
+  return {posts:parsePagePosts(bytes),forum_id,thread_id,page:{current_page,total_page,total_count:number(4)},response_sha256:createHash('sha256').update(bytes).digest('hex')}
 }
-export function parseSubPosts(bytes){const rows=[];for(const top of pbFields(bytes))if(top.field===2&&top.bytes)for(const p of pbFields(top.bytes))if(p.field===4&&p.bytes){const row={sub_reply_id:'',floor:0,likes:0,source_time:0,text:'',author:{uid:'',name:'',name_show:'',portrait:''}};for(const f of pbFields(p.bytes)){if(f.value!==undefined){if(f.field===1)row.sub_reply_id=f.value.toString();else if(f.field===3)row.source_time=small(f.value);else if(f.field===6)row.floor=small(f.value)}else if(f.field===2&&f.bytes){row.text+=pbText(f.bytes);const content=pbFields(f.bytes),type=content.find(part=>part.field===1)?.value,uid=content.find(part=>part.field===15)?.value;if(type===4n&&uid)row.mention_uids=[...(row.mention_uids??[]),uid.toString()]}else if(f.field===7&&f.bytes)row.author=pbUser(f.bytes);else if(f.field===9&&f.bytes)for(const a of pbFields(f.bytes))if(a.field===1&&a.value!==undefined)row.likes=small(a.value)}if(row.sub_reply_id)rows.push(row)}return rows}
+export function parseSubPosts(bytes){const rows=[];for(const top of pbFields(bytes))if(top.field===2&&top.bytes)for(const p of pbFields(top.bytes))if(p.field===4&&p.bytes){const row={sub_reply_id:'',floor:0,likes:0,source_time:0,text:'',author:{uid:'',name:'',name_show:'',portrait:''}},parts=[];for(const f of pbFields(p.bytes)){if(f.value!==undefined){if(f.field===1)row.sub_reply_id=f.value.toString();else if(f.field===3)row.source_time=small(f.value);else if(f.field===6)row.floor=small(f.value)}else if(f.field===2&&f.bytes){parts.push(f.bytes);const content=pbFields(f.bytes),type=content.find(part=>part.field===1)?.value,uid=content.find(part=>part.field===15)?.value;if(type===4n&&uid)row.mention_uids=[...(row.mention_uids??[]),uid.toString()]}else if(f.field===7&&f.bytes)row.author=pbUser(f.bytes);else if(f.field===9&&f.bytes)for(const a of pbFields(f.bytes))if(a.field===1&&a.value!==undefined)row.likes=small(a.value)}if(row.sub_reply_id)rows.push({...row,...parseTiebaContent(parts)})}return rows}
 export function parseSubPage(bytes){
   const top=pbFields(bytes),data=top.find(row=>row.field===2)?.bytes,error=top.find(row=>row.field===1)?.bytes
   if(error){const code=pbFields(error).find(row=>row.field===1)?.value??0n;if(code!==0n)throw new TiebaError('官方楼中楼读取被拒绝','read_failed',{server_code:small(code)})}

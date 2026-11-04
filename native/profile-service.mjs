@@ -66,6 +66,11 @@ export class NativeProfileService {
       `【当前有效人设：${label}】`,
       `名字：${profile.name}；自称：${profile.self_ref}；主人称呼：${profile.owner_address}。`,
     ]
+    if(platform==='tieba'){
+      const id=this.store.getDocument('settings')?.value.platform_document_ids?.tieba??'tieba',entity=this.store.getDocument(id)?.value.account_entity_id
+      const accounts=entity?this.store.listPlatformIdentities({namespace:'tieba',entity_id:entity,role:'account',limit:20}):[]
+      if(accounts.length===1&&accounts[0].display_name)lines.push('当前贴吧账号昵称：'+JSON.stringify(accounts[0].display_name)+'；UID '+accounts[0].platform_uid+'。这是你正在使用的同一个账号，角色名与平台昵称不一致不代表另一位用户；不要因为两个名字就虚构另一个账号。昵称不授予权限，也不据此关联其他人的私聊身份。')
+    }
     if (Object.keys(profile.traits).length) lines.push('性格参数：' + stringifyJson(profile.traits))
     const lists = [['samples', '参考句'], ['quirks', '习惯'], ['particles', '语气词'], ['patterns', '说话方式']]
     for (const [key, title] of lists) if (voice[key]?.length) lines.push(`${title}：${voice[key].join('；')}`)
