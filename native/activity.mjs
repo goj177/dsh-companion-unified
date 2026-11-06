@@ -51,14 +51,14 @@ function quietDecision(now,config){
  * public-send implementation exists in this module. */
 export class NativeActivity {
   constructor(options={}){
-    fields(options,['store','budget','money_budget','runner','publication_runner','now','activity_document_id','state_document_id'])
+    fields(options,['store','budget','money_budget','runner','publication_runner','model_gate','background_model','now','activity_document_id','state_document_id'])
     if(!(options.store instanceof NativeStore))throw new Error('NativeActivity必须显式使用NativeStore')
-    if(options.now!==undefined&&typeof options.now!=='function'||options.runner!==undefined&&typeof options.runner!=='function'||options.publication_runner!==undefined&&typeof options.publication_runner!=='function')throw new Error('活动时钟或runner必须为函数')
+    if(options.now!==undefined&&typeof options.now!=='function'||options.runner!==undefined&&typeof options.runner!=='function'||options.publication_runner!==undefined&&typeof options.publication_runner!=='function'||options.model_gate!==undefined&&typeof options.model_gate!=='function'||options.background_model!==undefined&&typeof options.background_model!=='function')throw new Error('活动时钟、准入检查或runner必须为函数')
     this.store=options.store;this.now=options.now??this.store.now;this.policy_id=text(options.activity_document_id??'activity','activity_document_id',160,true)
     this.state_id=text(options.state_document_id??'activity:state','state_document_id',160,true)
     this.budget=options.budget??new NativeBudget({store:this.store,now:this.now,policy_document_id:this.policy_id})
     if(!(this.budget instanceof NativeBudget)||this.budget.store!==this.store||this.budget.policyId!==this.policy_id)throw new Error('NativeActivity预算必须使用同一个NativeStore和活动策略')
-    this.runner=options.runner;this.publication_runner=options.publication_runner;this.money=options.money_budget;if(this.money&&this.money.store!==this.store)throw new Error('费用预算必须同库')
+    this.runner=options.runner;this.publication_runner=options.publication_runner;this.model_gate=options.model_gate;this.background_model=options.background_model;this.money=options.money_budget;if(this.money&&this.money.store!==this.store)throw new Error('费用预算必须同库')
   }
   _now(){this.store._open();return time(this.now(),'活动时钟')}
   _policy(){const doc=this.store.getDocument(this.policy_id);if(doc&&doc.type!=='activity')throw new Error('活动策略文档类型无效');return effectiveActivityPolicy({store:this.store,document_id:this.policy_id,now:this.now})}
@@ -94,7 +94,9 @@ export class NativeActivity {
     if(execution==='publication'&&kind!=='activity.incoming')throw new Error('准备发表只能进入独立publication incoming载体')
     const initial_status=choice(input.initial_status??'queued',['queued','draft'],'initial_status')
     if(kind==='activity.explore'){
-      const old=this._list(OPEN).find(row=>row.platform===platform&&row.kind===kind&&(!target.round_limits||encode(row.target.round_limits??{})===encode(target.round_limits)))
+      // A started, blocked model round has ended. Keep its outcome frozen;
+      // a later fresh round still passes current gates and has its own key.
+      const old=this._list(OPEN).find(row=>row.platform===platform&&row.kind===kind&&!(row.status==='blocked'&&(row.metadata.dispatch_started||row.metadata.model_started))&&(!target.round_limits||encode(row.target.round_limits??{})===encode(target.round_limits)))
       if(old){
         if(trigger==='manual'&&old.status==='queued'&&!old.metadata.dispatch_started&&!old.metadata.model_started&&old.metadata.trigger!=='manual'){
           const metadata={...old.metadata,trigger:'manual',last_error:''}
@@ -209,6 +211,7 @@ export class NativeActivity {
     if(block)return {reason:'platform_blocked',next_eligible_at:block.until??null,detail:block.reason}
     const platformState=this.store.getDocument('platform-state-'+task.platform)?.value
     if(platformState?.verification_required||platformState?.paused_until>now)return{reason:'platform_blocked',next_eligible_at:platformState.verification_required?null:platformState.paused_until,detail:platformState.verification_reason??'平台要求核验或退避'}
+    if(task.metadata.execution==='model'){const gate=this.model_gate?.(task);if(gate)return gate}
     const maintenance=task.kind==='activity.maintenance'&&task.metadata.execution==='model'&&['memory','mood','learning'].includes(task.target.maintenance_kind)
     if(task.platform==='qq'&&!task.metadata.human&&!maintenance){const quiet=quietDecision(now,p);if(quiet.quiet)return {reason:'qq_quiet',next_eligible_at:quiet.next_at}}
     if(task.not_before>now)return {reason:'not_before',next_eligible_at:task.not_before}
@@ -226,11 +229,11 @@ export class NativeActivity {
   _idle(state,p){
     const now=this._now(),cfg=p.idle??{},phase=valleyDecision(now,p)
     if(p.enabled!==true||cfg.enabled!==true||this.money?.enabled()&&this.money.status().remaining_nano<=0||!phase.valley||now-state.value.idle.last_activity_at<(cfg.min_idle_ms??2700000))return
-    const pending=this._list(['queued','leased','running']),active=pending.filter(task=>ACTIVE.includes(task.status)),models=active.filter(task=>task.metadata.execution==='model')
+    const pending=[...this._list(['queued','leased','running']),...this._list(['blocked']).filter(task=>task.kind==='activity.explore'&&!task.metadata.dispatch_started&&!task.metadata.model_started)],active=pending.filter(task=>ACTIVE.includes(task.status)),models=active.filter(task=>task.metadata.execution==='model')
     const foreground=models.filter(task=>!monitoredIncoming(task))
     if(new Set(foreground.map(task=>task.metadata.batch_id||task.id)).size>=(p.batching?.max_concurrent??1)||pending.some(task=>task.status==='queued'&&task.metadata.execution==='model'&&!monitoredIncoming(task)&&new Set(models.filter(row=>row.platform===task.platform).map(row=>row.metadata.batch_id||row.id)).size<(p.batching?.max_per_platform??1)&&this._gate(task,state,p,{include_batch:false}).reason==='ready'))return
     const choices=[]
-    const platforms=(cfg.explore_platforms??['bilibili','tieba']).filter(platform=>['tieba','bilibili'].includes(platform)&&!this._block(state,platform)&&!pending.some(task=>task.platform===platform&&task.metadata.execution==='model'&&!monitoredIncoming(task)&&(task.kind!=='activity.incoming'||ACTIVE.includes(task.status)||['ready','batching'].includes(this._gate(task,state,p,{include_batch:false}).reason))))
+    const platforms=(cfg.explore_platforms??['bilibili','tieba']).filter(platform=>{const provider=this.store.getDocument('platform-state-'+platform)?.value;return ['tieba','bilibili'].includes(platform)&&!this._block(state,platform)&&!provider?.verification_required&&!(provider?.paused_until>now)&&!pending.some(task=>task.platform===platform&&task.metadata.execution==='model'&&!monitoredIncoming(task)&&(task.kind!=='activity.incoming'||ACTIVE.includes(task.status)||['ready','batching'].includes(this._gate(task,state,p,{include_batch:false}).reason)))})
     if(platforms.length&&now>=state.value.idle.next_explore_at)choices.push({kind:'explore',at:state.value.idle.next_explore_at})
     const chats=[]
     for(const target of cfg.qq_targets??['owner','group']){
@@ -323,7 +326,7 @@ export class NativeActivity {
           this.store.db.prepare("UPDATE actions SET status='leased',metadata_json=?,updated_at=? WHERE id=? AND status='queued'").run(encode(metadata),now,task.id)
           task.metadata=metadata;task.status='leased';this._event(task,'leased')
         }
-        if(!publication&&!monitoredIncoming(first)){state.value.idle.last_activity_at=now;this._save(state)}
+        if(!publication&&!monitoredIncoming(first)&&this.background_model?.({kind:first.kind,platform:first.platform,tasks})!==true){state.value.idle.last_activity_at=now;this._save(state)}
         return {batch:{id:batch_id,batch_id,platform:first.platform,kind:first.kind,execution:first.metadata.execution,trigger:first.metadata.trigger,
           estimated_tokens,reservation_id:reservation?.reservation_id??'',lease_until,tasks:tasks.map(task=>this._get(task.id)),
           model:{reasoning_effort:p.model?.reasoning_effort??'low',max_output_tokens:valleyDecision(now,p).valley||first.metadata.trigger==='manual'||first.metadata.human?p.model?.max_output_tokens??1800:p.model?.peak_max_output_tokens??900,max_steps:p.budget?.max_steps??8}},lease_token}

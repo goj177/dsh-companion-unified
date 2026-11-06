@@ -4,6 +4,7 @@ import { NativeProfileService } from './profile-service.mjs'
 import { NativeMemory } from './memory.mjs'
 import { NativeDiary } from './diary.mjs'
 import { isPlainObject, validateJson } from './contracts.mjs'
+import {NativeUpdateChecker} from './update-check.mjs'
 
 export const NATIVE_ADMIN_BASE='/api/companion/v3'
 const PLATFORMS=['qq','bilibili','tieba']
@@ -57,7 +58,7 @@ const unavailable=message=>Object.assign(new Error(message||'此功能尚未就�
 const ownerContext={platform:'harness',conversation_id:'local-settings',owner_authorized:true,include_secret:false}
 
 export function createNativeAdminApi({store,profiles=new NativeProfileService({store}),memory=new NativeMemory(store),diary=new NativeDiary({store}),activity,hormone,learning_loop,consolidate_learning,tieba_atmosphere,
-  platforms={},people,affinities,portability,connection,on_change}={}){
+  platforms={},people,affinities,portability,connection,on_change,updates=new NativeUpdateChecker()}={}){
   if(!(store instanceof NativeStore))throw new Error('新版设置必须使用NativeStore')
   const ownerActivity=async()=>ownerActivityReports(store,activity?.status?await activity.status():{tasks:[],blocks:[],available:false})
   const snapshot=async()=>{
@@ -75,13 +76,14 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     const budget=tasks.budget??null,mood=store.getDocument('mood')?.value.state??null
     let hormoneStatus=null
     try{if(typeof hormone?.status==='function')hormoneStatus=hormone.status()}catch{hormoneStatus={available:false}}
-    return {ok:true,version:3,schema_version:3,documents,profiles:persona,overview:{budget,mood,hormone:hormoneStatus,money_budget:tasks.money_budget??null,platforms:platformStatus},activity:tasks,
+    return {ok:true,version:3,schema_version:3,documents,profiles:persona,updates:updates.status(),overview:{budget,mood,hormone:hormoneStatus,money_budget:tasks.money_budget??null,platforms:platformStatus},activity:tasks,
       capabilities:{documents:!store.readOnly,profiles:!store.readOnly,rounds:{bilibili:!!activity?.runOneRound&&!store.readOnly,tieba:!!activity?.runOneRound&&!store.readOnly},
-        memory:true,diary:true,people:typeof people==='function',portability:!!portability,learning:{items:typeof learning_loop?.list==='function',manage:typeof learning_loop?.manage==='function'&&!store.readOnly,consolidate:typeof consolidate_learning==='function'&&!store.readOnly},
+        memory:true,diary:true,update_check:true,people:typeof people==='function',portability:!!portability,learning:{items:typeof learning_loop?.list==='function',manage:typeof learning_loop?.manage==='function'&&!store.readOnly,consolidate:typeof consolidate_learning==='function'&&!store.readOnly},
         authentication:Object.fromEntries(PLATFORMS.map(p=>[p,!!platforms[p]?.login&&!store.readOnly])),platform_actions:{bilibili:{check_inbox:!!platforms.bilibili?.checkInbox&&!store.readOnly,reconcile_today:!!platforms.bilibili?.reconcileToday&&!store.readOnly},tieba:{atmosphere:typeof tieba_atmosphere?.list==='function',check_inbox:!!platforms.tieba?.checkInbox&&!store.readOnly,inspect_page:!!platforms.tieba?.inspectPage&&!store.readOnly,check_private:!!platforms.tieba?.checkPrivate&&!store.readOnly}}}}
   }
   const handlers=new Map(),route=(method,path,handler)=>handlers.set(method+' '+NATIVE_ADMIN_BASE+path,handler)
   route('GET','/snapshot',()=>snapshot())
+  route('POST','/updates/check',async(req)=>{const body=await readBody(req);allowedKeys(body,[]);return {ok:true,...await updates.check()}})
   route('GET','/activity',async()=>({ok:true,...await ownerActivity()}))
   route('GET','/tieba/atmosphere',async(_req,url)=>{
     if([...url.searchParams.keys()].some(key=>key!=='bar'))throw new Error('吧内参考查询含未知字段')

@@ -133,7 +133,7 @@ window.__ModuleLoader__.load({
     const stat=(label,value)=>{const text=printable(value);return h('div',{className:'oj3-stat'},hint(label),h('div',{className:'oj3-value',style:{'--oj-value-length':Math.max(8,String(text).length)}},text))}
     const busyTask = task => ['queued','leased','running','pending','submitted'].includes(task?.status)
     const taskState = task => ({queued:'排队中',pending:'排队中',leased:'执行中',running:'执行中',submitted:'已提交',completed:'已完成',done:'已完成',failed:'执行失败',blocked:'受限',cancelled:'已取消',draft:'待确认',unknown:'结果待核对'}[task?.display_status??task?.status]??(task?.status?'状态待确认':'尚无任务'))
-    const taskReason = reason => ({ready:'等待执行',valley:'等待谷时',peak:'等待谷时',outside_valley:'等待谷时',valley_ending:'本次谷时快结束了，等待下一次机会',budget:'今日自主预算不足',money_budget:'共享费用预算不足，暂停新的模型调用',disabled:'主动活动已关闭',platform_blocked:'平台暂时受限，等待处理',quiet_hours:'当前处于安静时段',approval_required:'等待确认发表',completed:'已完成',running:'正在执行',leased:'已领取任务',no_runner:'暂时无法执行'}[reason]??reason??'')
+    const taskReason = reason => ({ready:'等待执行',reply_wait:'等待平台回复额度恢复',valley:'等待谷时',peak:'等待谷时',outside_valley:'等待谷时',valley_ending:'本次谷时快结束了，等待下一次机会',budget:'今日自主预算不足',money_budget:'共享费用预算不足，暂停新的模型调用',disabled:'主动活动已关闭',platform_blocked:'平台暂时受限，等待处理',quiet_hours:'当前处于安静时段',approval_required:'等待确认发表',completed:'已完成',running:'正在执行',leased:'已领取任务',no_runner:'暂时无法执行'}[reason]??reason??'')
     const platformLabel = state => {
       const status=state?.status||state?.login_state
       const labels={inbox_partial:'部分收件通道受限',inbox_error:'收件检查失败，等待重试',quota_exhausted:'读取额度已用完，收件暂停',ready:'已就绪',verification_stale:'上次登录核验成功，等待刷新核验',unavailable:'暂时不可用',error:'平台状态暂时无法读取',connected:'已连接',connecting:'连接中',disconnected:'未连接',paused:'已暂停',verification_required:'需要手动验证',account_mismatch:'账号与当前绑定不一致',signed_out:state?.credential_configured?'登录待确认':'未登录'}
@@ -435,10 +435,16 @@ window.__ModuleLoader__.load({
         h('div',{className:'oj3-statgrid'},stat('压力',value(values.stress)),stat('精力',value(values.energy)),stat('愉悦',value(values.reward)),stat('无聊',value(values.boredom)),stat('熬夜疲劳',value(state.sleep_debt)),stat('当前精力上限',value(state.energy_ceiling))),
         history.length?h('details',{className:'oj3-details'},h('summary',null,'最近变化'),entries):hint('还没有活动变化记录。'))
     }
-    function Overview({snapshot,activity,onOpenPlatform}){
+    function UpdateCheck({snapshot,fetcher}){
+      const status=snapshot.updates,[result,setResult]=React.useState(status?.last_result??null),[busy,setBusy]=React.useState(false),[error,setError]=React.useState(''),alive=useAlive()
+      async function check(){if(busy)return;setBusy(true);setError('');try{const value=await apiRequest('/updates/check',{}, {fetcher});if(alive.current)setResult(value)}catch(error){if(alive.current){setError(error.message);setResult(null)}}finally{if(alive.current)setBusy(false)}}
+      const labels={available:'发现新版本',current:'已是最新版本',local_ahead:'本机版本较新',unreleased:'GitHub 暂无正式发布版本'}
+      return card('插件更新',null,h('div',{className:'oj3-inline'},hint('当前版本 '+(status?.current_version??'—')),button(busy?'检查中…':'检查更新',check,busy||snapshot.capabilities?.update_check!==true)),error?note(error,true):null,result?h('div',null,note((labels[result.status]??'检查完成')+(result.latest_version?' · GitHub '+result.latest_version:'')),hint('检查时间：'+dateText(result.checked_at)),h('div',{className:'oj3-actions'},result.status==='available'&&result.download_url?h('a',{href:result.download_url,target:'_blank',rel:'noreferrer'},'下载安装包'):null,h('a',{href:result.release_url,target:'_blank',rel:'noreferrer'},'查看 GitHub 发布'))):null)
+    }
+    function Overview({snapshot,activity,onOpenPlatform,fetcher}){
       const budget=snapshot.overview?.budget??{},mood=snapshot.overview?.mood??snapshot.documents?.mood?.value?.state??{},settings=snapshot.documents?.settings?.value??{}
       const limit=budget.daily_token_limit??budget.limit,used=budget.known_tokens??budget.tokens??budget.used??budget.used_tokens,energy=snapshot.overview?.hormone?.values?.energy
-      return h(React.Fragment,null,card('今天',null,h('div',{className:'oj3-inline'},hint('自动活动用量'),h('span',{className:'oj3-badge'},'心情 '+printable(mood.value??mood.mood)),snapshot.overview?.hormone?.enabled?h('span',{className:'oj3-badge'},'精力 '+printable(typeof energy==='number'&&Number.isFinite(energy)?Math.round(energy):undefined)):null),tokenStats(budget),
+      return h(React.Fragment,null,h(UpdateCheck,{snapshot,fetcher}),card('今天',null,h('div',{className:'oj3-inline'},hint('自动活动用量'),h('span',{className:'oj3-badge'},'心情 '+printable(mood.value??mood.mood)),snapshot.overview?.hormone?.enabled?h('span',{className:'oj3-badge'},'精力 '+printable(typeof energy==='number'&&Number.isFinite(energy)?Math.round(energy):undefined)):null),tokenStats(budget),
         typeof limit==='number'&&limit>0&&typeof used==='number'?h('div',{className:'oj3-progress','aria-label':'今日token使用比例'},h('span',{style:{width:Math.min(100,Math.max(0,used/limit*100))+'%'}})):null),
         card('平台',null,h('div',{className:'oj3-status-list'},['bilibili','tieba','qq'].map(platform=>{const state=Array.isArray(snapshot.overview?.platforms)?snapshot.overview.platforms.find(row=>row.platform===platform):snapshot.overview?.platforms?.[platform];return h('div',{key:platform,className:'oj3-row oj3-platform-row'},h('strong',null,NAMES[platform]),h('div',{className:'oj3-platform-state'},platformLabel(state)),onOpenPlatform?button('设置',()=>onOpenPlatform(platform)):null)})),h('details',{className:'oj3-details'},h('summary',null,'运行详情'),['bilibili','tieba','qq'].map(platform=>{const lane=activity?.concurrency?.platforms?.[platform];return lane?hint(NAMES[platform]+'：处理 '+lane.models+' / '+activity.concurrency.model_limit_per_platform+'，发送 '+lane.publications+' / '+activity.concurrency.publication_limit_per_platform):null}))),card('最近发生的事',null,h(TaskList,{activity,compact:true})))
     }
@@ -455,7 +461,7 @@ window.__ModuleLoader__.load({
       const form=(id,spec,title,subtitle)=>h(DocumentForm,{key:id+':'+title,document:document(id),spec:FIELDS[spec],title,subtitle,onSaved:reload,fetcher})
       let content=null
       if(snapshot){
-        if(section==='overview')content=h(Overview,{snapshot,activity,onOpenPlatform:platform=>{setSection('platforms');setPage(platform)}})
+        if(section==='overview')content=h(Overview,{snapshot,activity,fetcher,onOpenPlatform:platform=>{setSection('platforms');setPage(platform)}})
         if(section==='persona')content=page==='speech'?form(settings.speech_document_id??'speech','speech','说话方式'):page==='mood'?form(settings.mood_document_id??'mood','mood','心情'):page==='hormone'?h(React.Fragment,null,h(HormoneState,{state:snapshot.overview?.hormone}),form('hormone','hormone','精力与压力','与当前心情合并影响表达，状态由活动记录计算。')):h(PersonaForm,{key:page,platform:page,record:snapshot.profiles[page],onSaved:reload,fetcher})
         if(section==='memory')content=page==='search'?h(MemorySearch,{fetcher}):page==='diary'?h(Diary,{fetcher}):page==='people'?h(People,{fetcher,sharing:settings.familiarity?.sharing}):page==='learning'?h(React.Fragment,null,h(LearningItems,{snapshot,activity,onSaved:reload,onActivity:loadActivity,fetcher}),form(settings.learning_document_id??'learning','learning','学习设置'),form('learning-loop','learning_loop','表达与用法设置','自动整理遵守活动时段和额度。')):form('settings','memory','记忆设置')
         if(section==='activity'){
@@ -473,7 +479,7 @@ window.__ModuleLoader__.load({
           h('nav',{className:'oj3-nav',role:'tablist','aria-label':'设置主导航'},NAV.map(([id,label,pages])=>h('button',{key:id,type:'button',role:'tab','aria-selected':section===id,className:'oj3-tab',onClick:()=>{setSection(id);setPage(pages[0][0])}},label))),
           h('div',{className:'oj3-layout'},navigation[2].length>1?h('nav',{className:'oj3-subnav',role:'tablist','aria-label':navigation[1]+'分区'},navigation[2].map(([id,label])=>h('button',{key:id,type:'button',role:'tab','aria-selected':page===id,className:'oj3-subtab',onClick:()=>setPage(id)},label))):null,h('main',{className:'oj3-content',key:section+':'+page},content))))
     }
-    return {inject:['slots'],Panel,NAV,FIELDS,CSS,apiRequest,decodeField,buildPatch,createOperationGate,taskState,busyTask,DocumentForm,PersonaForm,ManualRound,InboxActions,ProgressBar,TaskProgress,AccountBinding,MemorySearch,Diary,People,QQAffinity,Portability,TaskList,TaskAction,HormoneState,LearningItem,LearningItems,TiebaAtmosphere,resultUrl,
+    return {inject:['slots'],Panel,NAV,FIELDS,CSS,apiRequest,decodeField,buildPatch,createOperationGate,taskState,busyTask,DocumentForm,PersonaForm,ManualRound,InboxActions,ProgressBar,TaskProgress,AccountBinding,MemorySearch,Diary,People,QQAffinity,Portability,TaskList,TaskAction,HormoneState,LearningItem,LearningItems,TiebaAtmosphere,UpdateCheck,resultUrl,
       apply(ctx){
         const style=document.createElement('style');style.setAttribute('data-plugin-css','companion-native-v3');style.textContent=CSS;document.head.appendChild(style)
         const slots=(typeof ctx.get==='function'?ctx.get('slots'):null)||ctx.slots,off=[()=>style.remove()]

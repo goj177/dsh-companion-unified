@@ -2,6 +2,7 @@
  * feedback attribution. This module never calls a model, changes a persona,
  * grants a permission, or publishes anything. */
 import {createHash} from 'node:crypto'
+import {isDeepStrictEqual} from 'node:util'
 import {NativeStore} from './store.mjs'
 import {isPlainObject} from './contracts.mjs'
 import {redactText} from './memory-rules.mjs'
@@ -14,6 +15,22 @@ export const LEARNING_LOOP_DEFAULTS=freeze({enabled:true,policy:{max_cards:200,m
 export const freshLearningLoopState=(at=0)=>({version:1,revision:0,updated_at:at,reviews:[],offers:[],usages:[],blocks:[]})
 const MINUTE=60000,DAY=86400000,PLATFORMS=['qq','tieba','bilibili','harness','system','web'],KINDS=['meme','phrase','habit'],STATUSES=['trial','active','paused','retired']
 const hash=value=>createHash('sha256').update(value).digest('hex'),clone=value=>structuredClone(value),normal=value=>String(value??'').normalize('NFKC').toLowerCase()
+/** Model output only. The current card remains complete; an exact historical
+ * duplicate points to it, while stored/admin versions stay untouched. */
+export function projectNativeLearningToolResult(value){
+  const current=value?.item?.value
+  if(value?.ok!==true||!isPlainObject(current)||!Array.isArray(current.versions))return value
+  let changed=false
+  const versions=current.versions.map(version=>{
+    if(!isPlainObject(version)||Object.hasOwn(version,'same_as_current'))return version
+    const same=['content','evidence_ids'].filter(key=>Object.hasOwn(current,key)&&Object.hasOwn(version,key)&&isDeepStrictEqual(version[key],current[key]))
+    if(!same.length)return version
+    const projected={...version,same_as_current:same};for(const key of same)delete projected[key]
+    if(JSON.stringify(projected).length>=JSON.stringify(version).length)return version
+    changed=true;return projected
+  })
+  return changed?{...value,item:{...value.item,value:{...current,versions}}}:value
+}
 const fields=(v,allowed)=>{if(!isPlainObject(v)||Object.keys(v).some(k=>!allowed.includes(k)))throw new Error('学习卡参数包含未知字段')}
 const text=(value,max,label='学习文本')=>{if(typeof value!=='string'||!value.isWellFormed()||value.length>max||value.includes('\0'))throw new Error(label+'无效');return redactText(value).replace(/[\r\n\t]+/g,' ').replace(/\s+/g,' ').trim()}
 const high=n=>n>=0xd800&&n<=0xdbff,low=n=>n>=0xdc00&&n<=0xdfff

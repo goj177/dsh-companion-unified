@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { NativeStore } from './store.mjs'
+import {nativeMemorySourceReadPolicy} from './memory-provenance.mjs'
 import {MEMORY_QUERY_MAX_CHARS} from './memory-query.mjs'
 import { stringifyJson } from './contracts.mjs'
 import { MEMORY_LEVELS, MEMORY_TYPES, ENTITY_TYPES, VISIBILITIES, SOURCE_TYPES, EVIDENCE_KINDS, DIRECTIONS,
@@ -130,12 +131,24 @@ export class NativeMemory {
   _canEntry(row,context) {
     if(!row||!visible(row,context))return false
     const evidence=this._support(row.id)
+    if(row.source_session_id){
+      const policies=evidence.map(source=>nativeMemorySourceReadPolicy({store:this.store,evidence:source,source_session_id:row.source_session_id}))
+      if(policies.some(policy=>policy.applies)&&policies.some(policy=>!policy.applies||!policy.allowed))return false
+    }
     // A globally addressable semantic summary never exposes secret evidence.
     if(evidence.some(item=>item.visibility==='secret')&&!(context.owner_authorized===true&&context.include_secret===true))return false
     if(context.owner_authorized===true)return true
     if(row.scope==='global')return true
     if(row.scope==='platform')return row.platform===context.platform
     return row.scope==='conversation'&&!!context.conversation_id&&row.platform===context.platform&&row.conversation_id===context.conversation_id
+  }
+  _canEvidence(row,context){return !!row&&visible(row,context)&&nativeMemorySourceReadPolicy({store:this.store,evidence:row}).allowed}
+  _canJournal(row,context){
+    if(!row||!visible(row,context))return false
+    const metadata=row.metadata??JSON.parse(row.metadata_json??'{}')
+    if(row.source_type!=='native_memory_ingest'||!metadata.evidence_id)return true
+    const source=this._effectiveEvidence(metadata.evidence_id)
+    return !!source&&this._canEvidence(source,context)
   }
   _identity(platform,actor_uid,actor_entity_id) {
     const identity=actor_uid?this.store.getPlatformIdentity(platform,actor_uid):null
@@ -319,7 +332,7 @@ export class NativeMemory {
   readEvidence(input, trusted_context = {}) {
     this.store._open();fields(input,['id','offset','max_chars'],'读取来源');identifier(input.id)
     const context=contextOf(trusted_context),row=this._effectiveEvidence(input.id)
-    if(!row||!visible(row,context))return {found:false,text:'没有该来源或当前上下文无读取权限。'}
+    if(!this._canEvidence(row,context))return {found:false,text:'没有该来源或当前上下文无读取权限。'}
     return {found:true,id:row.id,platform:row.platform,conversation_id:row.conversation_id,actor_entity_id:row.actor_entity_id,actor_uid:row.actor_uid,
       direction:row.direction,kind:row.kind,status:row.status,confirmation:row.confirmation,...this._evidenceDescription(row,context),visibility:row.visibility,ref:row.ref,
       source_at:row.source_at,source_time_raw:row.source_time_raw,source_type:row.source_type,source_message_id:row.source_message_id,
@@ -397,14 +410,14 @@ export class NativeMemory {
       for(const key of ['kind','direction'])if(input[key]!==undefined){conditions.push('evidence.'+key+'=?');parameters.push(input[key])}
       conditions.push("kind<>'receipt'")
       const rows=this.store.db.prepare(EVIDENCE_SELECT+' WHERE '+conditions.join(' AND ')+' ORDER BY source_at DESC,id').all(...parameters).map(evidenceRow)
-      for(const original of rows){const row=this._effectiveEvidence(original.id);if(visible(row,context)&&(input.status===undefined||row.status===input.status))all.push({id:row.id,source:'evidence',platform:row.platform,conversation_id:row.conversation_id,actor_entity_id:row.actor_entity_id,actor_uid:row.actor_uid,direction:row.direction,kind:row.kind,text:row.text,ref:row.ref,source_at:row.source_at,source_time_raw:row.source_time_raw,status:row.status,visibility:row.visibility,confirmation:row.confirmation,...this._evidenceDescription(row,context)})}
+      for(const original of rows){const row=this._effectiveEvidence(original.id);if(this._canEvidence(row,context)&&(input.status===undefined||row.status===input.status))all.push({id:row.id,source:'evidence',platform:row.platform,conversation_id:row.conversation_id,actor_entity_id:row.actor_entity_id,actor_uid:row.actor_uid,direction:row.direction,kind:row.kind,text:row.text,ref:row.ref,source_at:row.source_at,source_time_raw:row.source_time_raw,status:row.status,visibility:row.visibility,confirmation:row.confirmation,...this._evidenceDescription(row,context)})}
     }
     if(input.source!=='evidence'&&input.kind===undefined) {
       const {conditions,parameters}=this._conditions(input,q,{table:'journal_events',text:'text'})
       for(const key of ['event_type','direction','status'])if(input[key]!==undefined){conditions.push('journal_events.'+key+'=?');parameters.push(input[key])}
       const projection=select('journal_events',['text','ref','source_time_raw'])
       const rows=this.store.db.prepare(projection+(conditions.length?' WHERE '+conditions.join(' AND '):'')+' ORDER BY source_at DESC,id').all(...parameters).map(row=>decode(row,['text','ref','source_time_raw']))
-      for(const row of rows)if(visible(row,context))all.push({id:row.id,source:'journal',platform:row.platform,conversation_id:row.conversation_id,actor_entity_id:row.entity_id,actor_uid:row.actor_uid,direction:row.direction,event_type:row.event_type,text:row.text,ref:row.ref,source_at:row.source_at,source_time_raw:row.source_time_raw,status:row.status,visibility:row.visibility,label:row.status==='confirmed'?'带确认记录的经历；不独立证明正文事实':'经历/日志原始记事；不独立证明正文事实'})
+      for(const row of rows)if(this._canJournal(row,context))all.push({id:row.id,source:'journal',platform:row.platform,conversation_id:row.conversation_id,actor_entity_id:row.entity_id,actor_uid:row.actor_uid,direction:row.direction,event_type:row.event_type,text:row.text,ref:row.ref,source_at:row.source_at,source_time_raw:row.source_time_raw,status:row.status,visibility:row.visibility,label:row.status==='confirmed'?'带确认记录的经历；不独立证明正文事实':'经历/日志原始记事；不独立证明正文事实'})
     }
     all.sort((a,b)=>searchScore(b.text,q.terms)-searchScore(a.text,q.terms)||(b.source_at??0)-(a.source_at??0)||a.id.localeCompare(b.id))
     const items=[],lines=[];let used=0

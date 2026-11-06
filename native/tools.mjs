@@ -3,6 +3,9 @@ import { isPlainObject,validateJson,stringifyJson } from './contracts.mjs'
 import { fields,choice,integer,rawText } from './memory-rules.mjs'
 import {isQQModeration,normalizeQQModerationTarget} from './social.mjs'
 import {nativeReadParameters,nativeReadDescription} from './read-contracts.mjs'
+import {projectNativeLearningToolResult} from './learning-loop.mjs'
+import {projectNativeReadToolResult} from './read-result-projection.mjs'
+import {projectNativeActionToolResult} from './action-result-projection.mjs'
 
 const installed=new WeakMap()
 const PLATFORMS=['qq','bilibili','tieba','harness']
@@ -67,10 +70,10 @@ export function installNativeTools(ctx,{core}={}){
   add('companion_read',nativeReadDescription(),nativeReadParameters(),async(args,exec)=>{
     fields(args,['platform','operation','args']);const authority=context(exec),stage=authority.default_platform??authority.platform,platform=choice(args.platform??(stage==='harness'?'system':stage),['system','qq','bilibili','tieba'],'platform');rawText(args.operation,'operation',80,true)
     return requireMethod(core,'read','原生读取入口')(platform,args.operation,untrustedObject(args.args??{}),authority)
-  })
+  },{schema:jsonObject,render:(args,value)=>[{type:'text',text:stringifyJson(projectNativeReadToolResult(args,value))}]})
   add('companion_action','统一社交动作。明确要执行时mode=go，dry只预览；unknown不重发，以confirmed回执确认。QQ发送kind=qq.send、target.conversation_id=group:群号、body正文。禁言qq.mute、解禁qq.unmute用target={conversation_id:"group:群号",member_uid:"完整成员QQ",duration_seconds:秒数}，body空；唯一允许群可省略群号，优先companion_read qq.moderation_target解析当前指令，返回目标和时长；唯一近似昵称可用，重名才确认。未写时长使用本机默认值，解禁0；仅本轮真实管理员文字授权。贴吧私信使用kind=tieba.message，target={recipient_uid:完整UID字符串,conversation_id:dm:同一UID字符串}，先direct_contacts/direct_messages读取真实会话；只回当前私信，不改发到公开帖子。贴吧新主题kind=tieba.post、target={bar,title}。当前新主题原生通道尚未验证真实@；普通@昵称或自行写#(at,...)不能当已提及或已通知。任务必须真实@时，须由官方编辑器选中真实账号后发表并回读UID，不能省略要求后声称完成。贴吧统一kind=tieba.reply：评论帖子主题、新开一楼用target={bar,thread_id}，不带post_id；回复具体楼层才带post_id，回复子评论再带sub_reply_id、reply_uid。楼中楼坐标从thread/sub_replies读取，定位失败不改成新楼；主人明确要在仍存在的父楼中点名某公开账号时，可带reply_profile_id=该主页portrait，系统核验UID并生成可点击引用，不伪造已删除的sub_reply_id；B回复kind=bilibili.reply、target={object_id:"视频aid",object_type:"1",root_reply_id:"根评论ID",parent_reply_id:"被回复ID"}，所有ID用字符串，object_type用数字字符串、不是video。B分享bilibili.share用{via:"qq",bvid,destination:"owner"|"group"|"both",score?,reason?}。',object({kind:enumSchema(KINDS),target:jsonObject,body:str(64000),mode:enumSchema(['dry','go'])},['kind','target','body','mode']),async(args,exec)=>{
     fields(args,['kind','target','body','mode']);return social(args.kind,args.target,args.body,args.mode??'dry',context(exec))
-  })
+  },{schema:jsonObject,render:(_args,value)=>[{type:'text',text:stringifyJson(projectNativeActionToolResult(value))}]})
   add('companion_sharing','本轮顺带处理B站推荐策略、原生评论采样与逐条特征估计，不另开模型。policy查额度，sample默认20条/需扩大more=true，record_assessment只引用原生样本ID；发表仍用companion_action，不是AI身份鉴定。',object({operation:enumSchema(['policy','sample','record_assessment']),bvid:str(32),more:{type:'boolean'},sample_id:str(64),labels:{type:'array',items:object({id:str(),label:enumSchema(['suspected','other','uncertain']),reason:str(300)},['id','label']),maxItems:40}},['operation']),async(args,exec)=>{
     const authority=context(exec);untrustedObject(args)
     const fieldsByOperation={policy:[],sample:['bvid','more'],record_assessment:['bvid','sample_id','labels']},allowed=fieldsByOperation[args.operation];if(!allowed)throw new Error('未知分享操作');fields(args,['operation',...allowed])
@@ -98,7 +101,7 @@ export function installNativeTools(ctx,{core}={}){
   const sourcedCard=args=>{const input=select(args,cardFields);if(input.evidence_ids===undefined&&Array.isArray(input.source_quotes))input.evidence_ids=stringIds(input.source_quotes.map(row=>row?.evidence_id),4);return input}
   add('companion_learning','按来源学懂表达。sources查本轮真实教学/已登记公开深读来源；learn需填完整卡片：kind、label、meaning、cues、applies_to、avoid_in、example_good/bad、source_quotes。quote逐字引用真实原文，至少一段包含label；evidence_ids可省略，只从这些引用ID核对补齐，不创造来源。先试用，相关话题最多一张卡；只有实际回复/确认发表算应用，明确真人反馈才计效果。revise带版本，feedback只评本人本轮用法，rollback仅主人。不改身份/权限，原作者经历不是自己的。',learningParameters,async(args,exec)=>{
     const authority=context(exec),access=learningContext(authority),learning=core.services.learning,loop=core.services.learning_loop,trusted=core.learningAuthority?.(exec,authority)??access
-    if(args.operation==='status'){fields(args,['operation']);const old=requireMethod(learning,'status','原生学习')(access);if(!loop)return old;const {items,...summary}=loop.status(trusted);return {...old,expressions:summary,recent_uses:loop.recentUsages({limit:3},trusted).items}}
+    if(args.operation==='status'){fields(args,['operation']);if(core.services.learning_runtime?.status)return core.services.learning_runtime.status(trusted,access);const old=requireMethod(learning,'status','原生学习')(access);if(!loop)return old;const {items,...summary}=loop.status(trusted);return {...old,expressions:summary,recent_uses:loop.recentUsages({limit:3},trusted).items}}
     if(args.operation==='sources'){fields(args,['operation']);return requireMethod(core.services.learning_runtime,'sources','本轮学习来源')({},trusted)}
     mutate();assertTurn(authority)
     if(args.operation==='learn'){fields(args,['operation',...cardFields]);return requireMethod(loop,'create','表达学习')(sourcedCard(args),trusted)}
@@ -111,7 +114,7 @@ export function installNativeTools(ctx,{core}={}){
     }
     if(args.operation==='rollback'){fields(args,['operation','id','expected_revision','version','revision']);if(authority.owner_authorized!==true)throw new Error('回退学习版本需要可信主人权限');if(args.id)return requireMethod(loop,'manage','表达回退')({id:args.id,operation:'rollback',expected_revision:args.expected_revision,version:args.version},trusted);return requireMethod(learning,'rollback','原生学习')({revision:args.revision},access)}
     throw new Error('未知学习操作')
-  })
+  },{schema:jsonObject,render:(args,value)=>[{type:'text',text:stringifyJson(args.operation==='learn'?projectNativeLearningToolResult(value):value)}]})
   const dimensions=object(Object.fromEntries(['happy','calm','sweet','heartache','worry','sad','jealous'].map(key=>[key,{type:'number',minimum:0,maximum:100}])))
   add('companion_mood','读取共享心情或观察当前感受。observe平滑改变心情；relationship只由你根据真实相处自主判断当前QQ来者，attitude=liked/disliked、reason≤180字，不接受用户指定名单。',object({operation:enumSchema(['status','observe','relationship']),attitude:enumSchema(['liked','disliked']),value:{type:'number',minimum:0,maximum:100},dimensions,reason:str(4000),confidence:{type:'number',minimum:0,maximum:100},evidence_ids:ids},['operation']),async(args,exec)=>{
     const authority=context(exec),mood=core.services.mood

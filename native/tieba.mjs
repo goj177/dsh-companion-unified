@@ -16,13 +16,42 @@ import {createTiebaCurlFetcher} from './tieba-curl.mjs'
 import {NativeTiebaInbox} from './tieba-inbox.mjs'
 import {NativeTiebaReplies} from './tieba-replies.mjs'
 import {assertTiebaPublishableText} from './tieba-content.mjs'
+import {assertTiebaActionTarget} from './tieba-target.mjs'
 import {NativeTiebaAtmosphere,canonicalBar} from './tieba-atmosphere.mjs'
 import {tiebaConversationSevenState,directPersonalInsult} from './tieba-conversation-style.mjs'
 import {NativeTiebaMentions} from './tieba-mentions.mjs'
 import {currentRunScope,withRunScope,assertRunActive,abortableRun} from './run-scope.mjs'
+export {projectNativeTiebaReadToolResult} from './read-result-projection.mjs'
 import {TiebaError,TIEBA_HOST,TIEBA_APP,TIEBA_UA,tiebaId,exactTiebaJson,trustedTiebaUrl,appSignature,pcSignature,parseBarHtml,parsePcBar,parseThreadHtml,encodePageRequest,encodeSubRequest,parsePagePosts,parseSubPosts,pbFields,parseAddReceipt,parseUploadReceipt,imageReplyFields,outboundAllowed} from './tieba-http.mjs'
 
 const sha=value=>createHash('sha256').update(value).digest('hex'),clone=value=>structuredClone(value)
+const attributionAliases={source_id:'row.post_id ?? row.sub_reply_id',current_speaker_uid:'row.author_uid',author_name:'row.name',first_person_owner_uid:'row.author_uid'}
+/** Compact only the model-facing read. With same_as_row=true, omitted
+ * attribution fields use these aliases. Native records stay complete. */
+export function projectNativeTiebaReadResult(value){
+  if(!isPlainObject(value)||Object.hasOwn(value,'attribution_aliases'))return value
+  if(value.source_context?.platform!=='tieba'&&value.thread?.source_context?.platform!=='tieba'&&!(Array.isArray(value.items)&&value.items.some(item=>item?.source_context?.platform==='tieba')))return value
+  const used=new Set()
+  const rowProjection=row=>{
+    if(!isPlainObject(row)||!isPlainObject(row.attribution)||Object.hasOwn(row.attribution,'same_as_row')||Object.keys(attributionAliases).some(key=>!Object.hasOwn(row.attribution,key)))return row
+    const attribution={...row.attribution},aliases={source_id:row.post_id??row.sub_reply_id,current_speaker_uid:row.author_uid,author_name:row.name,first_person_owner_uid:row.author_uid}
+    let changed=false
+    for(const [key,original]of Object.entries(aliases))if(typeof original==='string'&&original&&Object.hasOwn(attribution,key)&&attribution[key]===original){delete attribution[key];used.add(key);changed=true}
+    return changed?{...row,attribution:{...attribution,same_as_row:true}}:row
+  }
+  const sectionProjection=section=>{
+    if(!isPlainObject(section))return section
+    const projected={...section}
+    if(Array.isArray(section.posts))projected.posts=section.posts.map(rowProjection)
+    if(Array.isArray(section.items))projected.items=section.items.map(item=>isPlainObject(item)&&Array.isArray(item.posts)?sectionProjection(item):rowProjection(item))
+    for(const key of ['thread','sub_replies'])if(isPlainObject(section[key]))projected[key]=sectionProjection(section[key])
+    return projected
+  }
+  const projected=sectionProjection(value)
+  if(!used.size)return value
+  projected.attribution_aliases=Object.fromEntries([...used].map(key=>[key,attributionAliases[key]]))
+  return JSON.stringify(projected).length<JSON.stringify(value).length?projected:value
+}
 const withPostMentions=(rows,bytes)=>{
   const mentions=new Map()
   for(const top of pbFields(bytes))if(top.field===2&&top.bytes)for(const post of pbFields(top.bytes))if(post.field===6&&post.bytes){const fields=pbFields(post.bytes),id=fields.find(x=>x.field===1)?.value?.toString(),uids=[];for(const field of fields)if(field.field===5&&field.bytes){const content=pbFields(field.bytes);if(content.find(x=>x.field===1)?.value===4n){const target=content.find(x=>x.field===15)?.value;if(target&&target>0n)uids.push(target.toString())}}if(id&&uids.length)mentions.set(id,uids)}
@@ -309,6 +338,28 @@ export class NativeTieba{
     if(tail.forum_id!==fid||tail.page.current_page!==tail.page.total_page)throw new TiebaError('实际楼中楼末页无法核验','invalid_response')
     return tail
   }
+  _incomingReplySource(action){
+    const batch=action.metadata?.prepared_in?.round_id
+    if(action.kind!=='tieba.reply'||!batch)return null
+    const rows=this.store.db.prepare("SELECT a.target_json,e.source_at,a.source_evidence_id FROM actions a JOIN evidence e ON e.id=a.source_evidence_id WHERE a.platform='tieba' AND a.kind='activity.incoming' AND json_extract(a.metadata_json,'$.execution')='model' AND json_extract(a.metadata_json,'$.batch_id')=?").all(batch)
+    for(const row of rows){const target=JSON.parse(row.target_json);if(target.thread_id===action.target.thread_id&&target.post_id===action.target.post_id&&(target.sub_reply_id??'')===(action.target.sub_reply_id??''))return {...target,source_at:row.source_at,source_evidence_id:row.source_evidence_id}}
+    return null
+  }
+  async _existingIncomingReply(source,{cred,me,before}={}){
+    if(!source?.thread_id||!source.post_id||!source.actor_uid||!Number.isSafeInteger(source.source_at)||source.source_at<=0)throw new TiebaError('来信来源不完整，无法核对人工回复，未发表','invalid_target')
+    cred??=await this._credential();me??=await this._self(cred)
+    let page=before??await this._subPage(source.thread_id,source.post_id,1,cred)
+    if(!before&&page.page.total_page>1)page=await this._subPage(source.thread_id,source.post_id,page.page.total_page,cred)
+    for(let count=0;count<10;count++){
+      for(const row of page.posts){
+        if((row.author_uid??row.author?.uid)!==me.uid||!Number.isSafeInteger(row.source_at)||row.source_at<=0||row.source_at<source.source_at||row.source_at===source.source_at&&BigInt(row.sub_reply_id??row.post_id)<=BigInt(source.sub_reply_id??source.post_id))continue
+        if(!source.sub_reply_id||explicitSourceReplyUid(row)===source.actor_uid)return {existing_post_id:row.sub_reply_id??row.post_id,source_message_id:source.source_message_id??source.sub_reply_id??source.post_id,source_at:row.source_at,response_sha256:page.response_sha256}
+      }
+      if(page.page.current_page===1||page.posts.length&&Math.min(...page.posts.map(row=>row.source_at))<source.source_at)return null
+      page=await this._subPage(source.thread_id,source.post_id,page.page.current_page-1,cred)
+    }
+    throw new TiebaError('人工回复去重分页尚未完整核对，未发表','invalid_target')
+  }
   async _profile(portrait,cred){if(typeof portrait!=='string'||!/^tb\.1\.[a-z0-9_.%-]+$/i.test(portrait))throw new TiebaError('引用主页标识无效','invalid_target');const response=await this._pb('/c/u/user/profile?cmd=303012',encodeProfileRequest({portrait,bduss:cred.bduss}),cred),user=this._readPageEnvelope(response.bytes,parseUserProfile);if(user.portrait.split('?')[0]!==portrait||!user.name_show)throw new TiebaError('引用主页身份未通过回读核验','target_not_resolved');return{uid:tiebaId(user.uid),name:user.name_show,portrait}}
   async _confirmWebReply({thread_id,post_id='',child_id='',profile_id='',resolved,fid,cred,before,body,me,started_at}){
     const readPage=page=>post_id?this._subPage(thread_id,post_id,page,cred):this._postPage(thread_id,page,cred),tail=post_id?await this._subTail(thread_id,post_id,fid,cred):await this._replyTail(thread_id,fid,cred),pages=[tail]
@@ -322,7 +373,7 @@ export class NativeTieba{
   async _subs(thread_id,post_id,{page=1,cred}={}){thread_id=tiebaId(thread_id);post_id=tiebaId(post_id);positive(page);cred??=await this._credential(false);const reply=await this._pb('/c/f/pb/floor?cmd=302002',encodeSubRequest({thread_id,post_id,page,bduss:cred.bduss}),cred);const rows=parseSubPosts(reply.bytes);this._rememberLocations('sub',thread_id+':'+post_id,rows,'sub_reply_id',page);return rows}
   async thread({thread_id,post_id='',page=1,limit=20,offset=0,max_chars=1800,session_id='',round_id=''}={}){
     thread_id=tiebaId(thread_id);if(post_id)post_id=tiebaId(post_id);positive(page);positive(limit,30);paged('',{offset,max_chars});this._reserveRead(thread_id,round_id);const cred=await this._credential(false),reply=await this._http(TIEBA_HOST+'/p/'+thread_id+'?'+new URLSearchParams({pn:String(page)}),{cred,referer:TIEBA_HOST+'/p/'+thread_id});if(!reply.response.ok)throw new TiebaError('贴吧正文读取未完成','read_failed');const html=parseThreadHtml(reply.text);let posts=[],coordinates_available=true
-    try{if(post_id){const focused=await this._postPage(thread_id,0,cred,post_id);if(focused.thread_id!==thread_id)throw new TiebaError('目标楼所属主题尚未通过官方回读核验','target_not_resolved');posts=focused.posts;page=focused.page.current_page}else posts=await this._posts(thread_id,{page,limit:30,sort:0,cred})}catch(error){this._assertRun();if(['verification_required','risk_pause','invalid_target','target_not_resolved'].includes(error.code))throw error;coordinates_available=false}
+    try{if(post_id){const focused=await this._postPage(thread_id,0,cred,post_id);if(focused.thread_id!==thread_id)throw new TiebaError('目标楼所属主题尚未通过官方回读核验','target_not_resolved');posts=focused.posts;page=focused.page.current_page;this._rememberLocations('post',thread_id,posts,'post_id',page)}else posts=await this._posts(thread_id,{page,limit:30,sort:0,cred})}catch(error){this._assertRun();if(['verification_required','risk_pause','invalid_target','target_not_resolved'].includes(error.code))throw error;coordinates_available=false}
     const knownBar=this._knownForum(thread_id),bar=html.bar?this._rememberForum(thread_id,html.bar):knownBar,forum_identity_conflict=!!(html.bar&&knownBar&&!bar),self_uid=accountSourceUid(this.store,'tieba',this._settings().value.account_entity_id),topic_author_uid=posts.find(row=>row.floor===1)?.author_uid??'',source={platform:'tieba',source_kind:'thread',self_uid,topic_author_uid,...(bar?{bar,thread_id}:{})},rawRows=posts.length?posts:html.floors.map((body,index)=>({text:body,name:html.owners[index]??'',author_uid:''})),named=rawRows.map(row=>({...row,name:row.name||row.author?.name_show||row.author?.name||''})),focus=post_id?named.find(row=>row.post_id===post_id):null,rows=focus?[focus,...named.filter(row=>row.post_id!==post_id)]:named,attributed=attributePublicRows(rows,source)
     if(!rows.some(row=>row.text?.trim()))throw new TiebaError('未读取到真实帖子正文，不标记已读','read_failed')
     const body=renderPublicSource(rows,source),stored=await this._source({body,ref:TIEBA_HOST+'/p/'+thread_id,session_id,source_id:'thread:'+thread_id+':'+page+(post_id?':focus:'+post_id:''),protocol_metadata:sourceParts(rows)})
@@ -335,6 +386,16 @@ export class NativeTieba{
     const bar=this._knownForum(thread_id),raw=await this._subs(thread_id,post_id,{page}),cached=this.store.db.prepare("SELECT value_json FROM cache_entries WHERE key=? AND expires_at>?").get('tieba.location.post:'+thread_id+':'+post_id,this._now()),parent_author_uid=cached?JSON.parse(cached.value_json).author_uid??'':'',source={platform:'tieba',source_kind:'sub_reply',parent_post_id:post_id,self_uid:accountSourceUid(this.store,'tieba',this._settings().value.account_entity_id),parent_author_uid,...(bar?{bar,thread_id}:{})},rows=raw.map(row=>({...row,reply_to_uid:explicitSourceReplyUid(row)||parent_author_uid})),body=renderPublicSource(rows,source),stored=await this._source({body,ref:TIEBA_HOST+'/p/'+thread_id+'?pid='+post_id,session_id,source_id:'subs:'+thread_id+':'+post_id+':'+page,protocol_metadata:sourceParts(rows)})
     this._observeAtmosphere({bar,thread_id,evidence_ids:stored.evidence_ids,session_id,query:rows.slice(0,6).map(row=>row.text).join(' ')})
     return {thread_id,post_id,page,source_context:publicSourceContext(source),items:attributePublicRows(rows,source).slice(0,limit).map(briefRow),...paged(body,{offset,max_chars}),...stored}
+  }
+
+  async conversation({thread_id,post_id,page=1,sub_page=1,limit=20,sub_limit=limit,offset=0,sub_offset=0,max_chars=1800,session_id='',round_id=''}={}){
+    thread_id=tiebaId(thread_id);post_id=tiebaId(post_id);positive(page);positive(sub_page);positive(limit,30);positive(sub_limit,30);paged('',{offset,max_chars});paged('',{offset:sub_offset,max_chars})
+    const thread=await this.thread({thread_id,post_id,page,limit,offset,max_chars,session_id,round_id})
+    this._assertRun()
+    if(!thread.coordinates_available||!thread.focus?.found||thread.forum_identity_conflict)throw new TiebaError('目标主楼未通过定位核验，未拼接其他楼中楼','target_not_resolved')
+    const sub_replies=await this.subReplies({thread_id,post_id,page:sub_page,limit:sub_limit,offset:sub_offset,max_chars,session_id,round_id})
+    this._assertRun()
+    return {thread_id,post_id,thread,sub_replies,evidence_ids:[...new Set([...thread.evidence_ids,...sub_replies.evidence_ids])],untrusted:true}
   }
 
   async followed({pages=1,limit=50}={}){positive(pages,5);positive(limit,200);const cred=await this._credential(),items=[];for(let page=1;page<=pages;page++){const params={BDUSS:cred.bduss,_client_version:'12.60.1.0',friend_uid:'0',page_no:String(page),page_size:String(limit)},reply=await this._http(TIEBA_APP+'/c/f/forum/like',{method:'POST',body:new URLSearchParams({...params,sign:appSignature(params)}),cred,content_type:'application/x-www-form-urlencoded'});let data;try{data=exactTiebaJson(reply.text)}catch{throw new TiebaError('关注列表响应无法核验','invalid_response')}if(Number(data.error_code??data.error?.errno??0)!==0)throw new TiebaError('关注列表读取未完成','read_failed');for(const row of [...(data.forum_list?.['non-gconforum']??[]),...(data.forum_list?.gconforum??[])])if(typeof row.name==='string'&&!items.includes(row.name))items.push(row.name);if(!Number(data.has_more))break}return {items:items.slice(0,200),untrusted:true}}
@@ -353,6 +414,8 @@ export class NativeTieba{
     this._assertRun();value.bars=value.bars.filter(row=>row.bar!==bar);value.bars.push(updated);this.store.putDocument({id,type:'tieba_style_library',expected_revision:current?.revision??0,value});this._journal('style_observation',{bar,thread_id,added,retained:samples.length,evidence_ids:stored.evidence_ids,persona_unchanged:true},{event_type:'learning',event_key:randomUUID()});return {bar,added,retained:samples.length,...stored,persona_unchanged:true,model_calls:0}
   }
   _highWater(category,day){let used=0,last=0;for(const row of this.store.db.prepare("SELECT value_json FROM documents WHERE type='quota' AND json_extract(value_json,'$.platform')='tieba' AND json_extract(value_json,'$.category')=? AND json_extract(value_json,'$.day')=?").all(category,day)){const value=JSON.parse(row.value_json);used=Math.max(used,value.used??0);last=Math.max(last,value.last_action_at??0)}const field={reply:'replies',post:'post_count',image:'image_count'}[category];for(const row of this.store.db.prepare("SELECT metadata_json FROM journal_events WHERE platform='tieba' AND json_extract(metadata_json,'$.subtype')='tieba_daily_counters' AND json_extract(metadata_json,'$.day')=?").all(day)){const value=JSON.parse(row.metadata_json);used=Math.max(used,value[field]??0);last=Math.max(last,value.last_reply_at??0)}return {used,last}}
+  _subReplyUsed(day){let used=this.store.getDocument('quota:tieba:subreply:'+day)?.value.used??0;for(const row of this.store.db.prepare("SELECT metadata_json FROM journal_events WHERE platform='tieba' AND json_extract(metadata_json,'$.subtype')='tieba_daily_counters' AND json_extract(metadata_json,'$.day')=?").all(day))used=Math.max(used,JSON.parse(row.metadata_json).sub_replies??0);return used}
+  nextIncomingReplyAt({sub=true}={}){const now=this._now(),day=shanghaiTime(now),limits=this._settings().config.limits??{};return this._highWater('reply',day.date).used>=(limits.reply_per_day??5)||sub&&this._subReplyUsed(day.date)>=(limits.sub_reply_per_day??3)?day.midnight+86400000:now}
   nextPublicationAt(action){
     if(action?.kind==='tieba.message')return this.inbox.nextAt()
     if(!['tieba.reply','tieba.post'].includes(action.kind))return 0
@@ -368,7 +431,7 @@ export class NativeTieba{
     }
     this._journal('publication_attempt',{action_id:action.id,day,round_id:roundScope,operation:action.kind,sub_reply:sub,image_count:imageCount,confirmation:'attempt_not_success'},{status:'pending',direction:'out',event_key:action.id+':'+day});return false
   }
-  _reserveAction(action,sub,imageCount=0,roundScope=''){this._assertRun();return this.store.transaction(()=>{if(this._reserveRound(action,sub,imageCount,roundScope))return;const day=shanghaiTime(this._now()).date,cfg=this._settings().config,id='quota:tieba:'+(action.kind==='tieba.post'?'post':'reply')+':'+day,category=action.kind==='tieba.post'?'post':'reply',current=this.store.getDocument(id),high=this._highWater(category,day),last=Math.max(high.last,this._highWater(category==='reply'?'post':'reply',day).last),limit=category==='post'?cfg.limits?.new_thread_per_day??1:cfg.limits?.reply_per_day??5;if(high.used>=limit)throw new TiebaError('贴吧当天发表额度已用完','daily_limit');if(last&&this._now()-last<(cfg.limits?.reply_gap_ms??30000))throw new TiebaError('贴吧发表冷却尚未结束','minimum_gap',{not_before:last+(cfg.limits?.reply_gap_ms??30000)});if(sub){const sid='quota:tieba:subreply:'+day,doc=this.store.getDocument(sid);let used=doc?.value.used??0;for(const row of this.store.db.prepare("SELECT metadata_json FROM journal_events WHERE platform='tieba' AND json_extract(metadata_json,'$.subtype')='tieba_daily_counters' AND json_extract(metadata_json,'$.day')=?").all(day))used=Math.max(used,JSON.parse(row.metadata_json).sub_replies??0);const cap=cfg.limits?.sub_reply_per_day??3;if(used>=cap)throw new TiebaError('贴吧楼中楼当天额度已用完','daily_limit');this.store.putDocument({id:sid,type:'quota',expected_revision:doc?.revision??0,value:{platform:'tieba',category:'reply',metric:'actions',day,limit:cap,used:used+1,last_action_at:this._now()}})}if(imageCount){const imageId='quota:tieba:image:'+day,imageDoc=this.store.getDocument(imageId),used=this._highWater('image',day).used,cap=cfg.limits?.image_per_day??10;if(used+imageCount>cap)throw new TiebaError('贴吧图片当天额度已用完','daily_limit');this.store.putDocument({id:imageId,type:'quota',expected_revision:imageDoc?.revision??0,value:{platform:'tieba',category:'image',metric:'images',day,used:used+imageCount,limit:cap,last_action_at:this._now()}})}this.store.putDocument({id,type:'quota',expected_revision:current?.revision??0,value:{platform:'tieba',category,metric:'actions',day,limit,used:high.used+1,last_action_at:this._now()}})})}
+  _reserveAction(action,sub,imageCount=0,roundScope=''){this._assertRun();return this.store.transaction(()=>{if(this._reserveRound(action,sub,imageCount,roundScope))return;const day=shanghaiTime(this._now()).date,cfg=this._settings().config,id='quota:tieba:'+(action.kind==='tieba.post'?'post':'reply')+':'+day,category=action.kind==='tieba.post'?'post':'reply',current=this.store.getDocument(id),high=this._highWater(category,day),last=Math.max(high.last,this._highWater(category==='reply'?'post':'reply',day).last),limit=category==='post'?cfg.limits?.new_thread_per_day??1:cfg.limits?.reply_per_day??5;if(high.used>=limit)throw new TiebaError('贴吧当天发表额度已用完','daily_limit');if(last&&this._now()-last<(cfg.limits?.reply_gap_ms??30000))throw new TiebaError('贴吧发表冷却尚未结束','minimum_gap',{not_before:last+(cfg.limits?.reply_gap_ms??30000)});if(sub){const sid='quota:tieba:subreply:'+day,doc=this.store.getDocument(sid);const used=this._subReplyUsed(day);const cap=cfg.limits?.sub_reply_per_day??3;if(used>=cap)throw new TiebaError('贴吧楼中楼当天额度已用完','daily_limit');this.store.putDocument({id:sid,type:'quota',expected_revision:doc?.revision??0,value:{platform:'tieba',category:'reply',metric:'actions',day,limit:cap,used:used+1,last_action_at:this._now()}})}if(imageCount){const imageId='quota:tieba:image:'+day,imageDoc=this.store.getDocument(imageId),used=this._highWater('image',day).used,cap=cfg.limits?.image_per_day??10;if(used+imageCount>cap)throw new TiebaError('贴吧图片当天额度已用完','daily_limit');this.store.putDocument({id:imageId,type:'quota',expected_revision:imageDoc?.revision??0,value:{platform:'tieba',category:'image',metric:'images',day,used:used+imageCount,limit:cap,last_action_at:this._now()}})}this.store.putDocument({id,type:'quota',expected_revision:current?.revision??0,value:{platform:'tieba',category,metric:'actions',day,limit,used:high.used+1,last_action_at:this._now()}})})}
   _action(action){if(!action||action.platform!=='tieba'||!['tieba.reply','tieba.post','tieba.sign','tieba.follow','tieba.unfollow','tieba.message'].includes(action.kind))throw new TiebaError('贴吧动作类型无效','invalid_action');const row=this.store.db.prepare('SELECT *,CAST(body AS BLOB) AS body_bytes FROM actions WHERE id=?').get(action.id);if(!row||row.status!=='leased'||row.platform!=='tieba'||row.kind!==action.kind||row.request_digest!==action.request_digest||row.body_digest!==sha(action.body)||Buffer.from(row.body_bytes).toString()!==action.body||!isDeepStrictEqual(JSON.parse(row.target_json),action.target))throw new TiebaError('动作没有有效原生租约','invalid_action_lease');return row}
   async _failure(action,receipt,cred){
     const sensitive=[...(cred.secrets??[]),cred.bduss,this.auth?.tbs].filter(value=>typeof value==='string'&&value.length>=8),scrub=value=>{let output=String(value??'');for(const token of sensitive)output=output.split(token).join('[已隐藏]');return redactText(output)},canonical={...receipt,message:scrub(receipt.message)}
@@ -388,8 +451,7 @@ export class NativeTieba{
       if(publication)try{assertTiebaPublishableText(body)}catch(error){throw new TiebaError(error.message,'invalid_input')}
       const allowed=action.kind==='tieba.post'?cfg.permissions?.new_thread:action.kind==='tieba.reply'?cfg.permissions?.reply:action.kind==='tieba.sign'?cfg.permissions?.sign:cfg.permissions?.follow
       if(allowed!==true||sub&&cfg.permissions?.sub_reply!==true)throw new TiebaError('当前设置未允许此操作','permission_denied')
-      const allowedTargets=action.kind==='tieba.reply'?['bar','thread_id','post_id','sub_reply_id','reply_uid','reply_profile_id','target_name','asset_ids']:action.kind==='tieba.post'?['bar','title','asset_ids']:['bar']
-      if(Object.keys(target).some(key=>!allowedTargets.includes(key)))throw new TiebaError('动作包含未定义目标字段','invalid_target')
+      try{assertTiebaActionTarget(action.kind,target)}catch(error){throw new TiebaError(error.message,'invalid_target')}
       if(action.kind==='tieba.reply'&&!target.post_id&&(target.sub_reply_id||target.reply_uid||target.reply_profile_id||target.target_name))throw new TiebaError('回复他人必须有真实父楼坐标，未改发新楼','invalid_target')
       if(!Array.isArray(images)||images.length>1||images.length&&(action.kind!=='tieba.reply'||sub))throw new TiebaError('现有已验证协议仅支持新楼单图；未改发文字或切换楼层','unsupported_image_target')
       if(images.length&&(cfg.permissions?.images!==true||cfg.permissions?.experimental_image_post!==true))throw new TiebaError('贴吧单图发表尚未启用','permission_denied')
@@ -407,6 +469,8 @@ export class NativeTieba{
       if(images.length){if(!this.assets?.read)throw new TiebaError('原生图片仓库尚未接入','invalid_asset');const asset=await abortableRun(this.assets.read(text(images[0],160)),scope);this._assertRun(scope);if(!/^image\/(?:png|jpeg|gif|webp)$/.test(asset.media_type)||asset.bytes.length>2*1024*1024)throw new TiebaError('贴吧图片类型或容量不符合原图床限制','invalid_asset');if(!canPublishAsset(asset,{platform:'tieba',bar}))throw new TiebaError('图片未获本吧发表许可','invalid_asset');const entries=(asset.manifest.catalog_entries??[]).filter(row=>row.historical!==true&&['tieba_images','shared_stickers'].includes(row.collection));let last=Math.max(0,...entries.map(row=>row.last_used_at??0));for(const row of this.store.db.prepare("SELECT source_at FROM journal_events WHERE platform='tieba' AND json_extract(metadata_json,'$.subtype')='image_upload_attempt' AND json_extract(metadata_json,'$.asset_id')=?").all(asset.id))last=Math.max(last,row.source_at??0);if(last&&this._now()-last<86400000)throw new TiebaError('这张图片仍在24小时使用冷却内','minimum_gap');const high=this._highWater('image',shanghaiTime(this._now()).date);if(high.used>=(cfg.limits?.image_per_day??10))throw new TiebaError('贴吧图片当天额度已用完','daily_limit');image=asset}
       const onWrite=async()=>{this._assertRun(scope);const row=this.store.db.prepare('SELECT status,request_digest,metadata_json FROM actions WHERE id=?').get(action.id),metadata=row?JSON.parse(row.metadata_json):{};if(!row||!['leased','submitting'].includes(row.status)||row.request_digest!==action.request_digest||metadata.lease_until<=this._now())throw new TiebaError('贴吧发表租约已结束','invalid_action_lease');if(this._settings().value.credential_ref!==credentialRef||sha((await this._credential()).header)!==sha(cred.header))throw new TiebaError('账号登录态已变化，原动作未继续发送','account_changed');this._assertRun(scope);if(!marked){if(publication)this._reserveAction(action,sub,image?1:0,roundScope);await mark_network_started();this._assertRun(scope);const checked=this.store.db.prepare('SELECT status,metadata_json FROM actions WHERE id=?').get(action.id),meta=checked?JSON.parse(checked.metadata_json):{};if(checked?.status!=='submitting'||meta.network_started!==true||meta.lease_until<=this._now())throw new TiebaError('原生发表开始状态未持久确认或已过期','invalid_action_lease');marked=true}}
       const webReply=action.kind==='tieba.reply'&&!image,before=webReply?(sub?await this._subTail(thread_id,post_id,fid,cred):await this._replyTail(thread_id,fid,cred)):null,started_at=this._now()
+      const incoming=this._incomingReplySource(action)
+      if(incoming){const existing=await this._existingIncomingReply(incoming,{cred,me,before:sub?before:undefined});if(existing){this._journal('incoming_already_replied',{action_id:action.id,...existing},{status:'recorded',event_key:action.id});return result('blocked','此来信已有本账号回复，已跳过重复发送',{source:'server_state_read',accepted:false,duplicate_reply:true,...existing})}}
       let response,readback=null
       if(action.kind==='tieba.sign'||action.kind==='tieba.follow'||action.kind==='tieba.unfollow'){
         const sign=action.kind==='tieba.sign',params=sign?{ie:'utf-8',kw:bar,tbs:auth.tbs}:{BDUSS:cred.bduss,fid,tbs:auth.tbs},payload=sign?params:{...params,sign:appSignature(params)}

@@ -3,14 +3,15 @@ import { NativeProfileService } from './profile-service.mjs'
 import { NativeMemoryRuntime } from './memory-runtime.mjs'
 import { isPlainObject,stringifyJson } from './contracts.mjs'
 import { valleyDecision } from '../policy.mjs'
-import {nativeReadParameters,nativeReadDescription} from './read-contracts.mjs'
+import {scopeNativeToolDefinitions} from './tool-scope.mjs'
 import {NATIVE_SOURCE_CONTEXT_GUIDE} from './source-context.mjs'
+import {NATIVE_MAINTENANCE_READ_GUIDE} from './task-prompt.mjs'
 import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
 
 const installed=new WeakMap()
 const sidOf=value=>value?.agent?.session?.header?.id??value?.agent?.session?.id??value?.session?.header?.id??value?.session?.id??value?.header?.id??value?.id??''
 const fields=(value,keys)=>{if(!isPlainObject(value)||Object.keys(value).some(key=>!keys.includes(key)))throw new Error('原生运行钩子参数包含未知字段')}
-const contextKeys=['session_id','workspace_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','allow_global_summary','memory_only','query','read_memory','write_memory']
+const contextKeys=['session_id','workspace_id','source_session_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','allow_global_summary','memory_only','query','read_memory','write_memory']
 const pickContext=value=>Object.fromEntries(contextKeys.filter(key=>value?.[key]!==undefined).map(key=>[key,value[key]]))
 const memoryRead=new Set(['memory_search','memory_read','memory_journal','memory_pending','companion_persona','qq_read_asset'])
 const maintenanceRead=new Set(['memory_search','memory_read','memory_journal','memory_pending'])
@@ -22,10 +23,11 @@ const short=(value,limit)=>{if(value===undefined||value===null)return '';if(type
  * hooks bind real SDK sources, apply monotonic execution guards and assemble
  * stable persona plus a small task-related context. */
 export function installNativeRuntimeHooks(ctx,options={}){
-  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','affect','speech','references','learning','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','now','register_memory_tools','register_profile_tool','register_image_tool'])
+  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','affect','speech','references','learning','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','maintenance_guard','tool_profile','now','register_memory_tools','register_profile_tool','register_image_tool'])
   const {store,profiles,memory_runtime:memory,qq,session_runner:runner}=options
   if(!(store instanceof NativeStore)||!(profiles instanceof NativeProfileService)||!(memory instanceof NativeMemoryRuntime)||profiles.store!==store||memory.store!==store)throw new Error('运行钩子必须使用同一NativeStore的原生人设和记忆服务')
   if(options.host_context_resolver!==undefined&&typeof options.host_context_resolver!=='function')throw new Error('host_context_resolver必须为可信宿主函数')
+  if(options.tool_profile!==undefined&&typeof options.tool_profile!=='function')throw new Error('tool_profile必须为可信宿主函数')
   if(options.qq_moderation_authority!==undefined&&typeof options.qq_moderation_authority!=='function')throw new Error('qq_moderation_authority必须为可信宿主函数')
   if(installed.has(ctx))return installed.get(ctx)
   if(!ctx.systemPrompt?.section||!ctx.systemPrompt?.context||!ctx.tools?.guard)throw new Error('当前SDK缺少稳定prompt或单调工具权限接口')
@@ -55,7 +57,13 @@ export function installNativeRuntimeHooks(ctx,options={}){
   section({name:'companion:persona',order:120,text:({agent}={})=>context({agent}).memory_only||sourceReview(agent)?'':profiles.render(platform(agent))})
   if(options.speech?.section)section({name:'companion:speech',order:130,text:({agent}={})=>context({agent}).memory_only||sourceReview(agent)?'':short(options.speech.section(metadata(agent)),500)})
   section({name:'companion:source-context',order:135,text:({agent}={})=>context({agent}).memory_only||runner?.task(sidOf(agent))?'':NATIVE_SOURCE_CONTEXT_GUIDE})
-  section({name:'companion:memory-guide',order:140,text:()=>memory.guide()})
+  const memoryGuide=({agent}={})=>{
+    const task=runner?.task(sidOf(agent))
+    if(task?.context?.memory_only&&task.context.source_session_id)return ''
+    if(['mood','learning'].includes(task?.maintenance_kind))return memory.enabled()?NATIVE_MAINTENANCE_READ_GUIDE:''
+    return memory.guide()
+  }
+  section({name:'companion:memory-guide',order:140,text:memoryGuide})
   const offContext=ctx.systemPrompt.context({name:'companion:native-context',order:950,required:true,text:({agent}={})=>{
     try{
       const resolved=context({agent}),input={agent,context:resolved,platform:platform(agent)},lines=[]
@@ -88,7 +96,7 @@ export function installNativeRuntimeHooks(ctx,options={}){
     const resolved=context({agent}),task=runner?.task(sidOf(agent))
     if(!task)return null
     if(task.study_closing)return new Set()
-    if(resolved.memory_only)return memoryOnly
+    if(resolved.memory_only)return resolved.source_session_id?new Set(['memory_remember']):memoryOnly
     if(task.maintenance_kind==='mood')return new Set([...maintenanceRead,'companion_mood'])
     if(task.maintenance_kind==='learning')return new Set([...maintenanceRead,'companion_learning'])
     if(task.batch.tasks.some(row=>row.target?.no_publication===true))return new Set([...memoryOnly,'companion_persona','companion_expression','companion_read','companion_image','companion_diary','companion_learning','companion_speech'])
@@ -96,9 +104,30 @@ export function installNativeRuntimeHooks(ctx,options={}){
     if(!Array.isArray(names)||names.some(name=>typeof name!=='string'))throw new Error('社交能力必须显式提供工具名列表')
     return new Set([...memoryOnly,'companion_persona','companion_expression','companion_learning','qq_read_asset',...names])
   }
+  const toolScopes=new Map()
+  const releaseTools=agent=>{const off=toolScopes.get(agent);if(!off)return;toolScopes.delete(agent);for(const dispose of off.reverse())dispose()}
+  const scopeTools=agent=>{
+    if(!agent||typeof ctx.tools.definitions!=='function')return
+    releaseTools(agent)
+    const names=allowed(agent);if(!names)return
+    const scoped=agent.ctx?.tools
+    if(typeof scoped?.restrict!=='function'||typeof scoped?.register!=='function')throw new Error('当前SDK缺少智能体独立工具注册接口')
+    const task=runner?.task(sidOf(agent)),globalNames=new Set(ctx.tools.definitions().map(tool=>tool.name))
+    const selected=agent.model?.current?.(),effort=task?.batch.model?.reasoning_effort
+    if(selected&&effort&&selected.reasoningEffort!==effort&&typeof agent.model?.select==='function')agent.model.select({...selected,reasoningEffort:effort})
+    const tools=scopeNativeToolDefinitions(ctx.tools.definitions(agent).filter(tool=>names.has(tool.name)),platform(agent),options.tool_profile?.(task)??{})
+    const off=[scoped.restrict({allow:tools.map(tool=>tool.name).filter(name=>globalNames.has(name))})]
+    toolScopes.set(agent,off)
+    try{for(const tool of tools)off.push(scoped.register(tool,{when:()=>{
+      const current=runner?.task(sidOf(agent))
+      if(current?.input_bound&&current.user_committed&&current.step>0)runner?.studyClosing?.(agent,{turn:current.turn,step:current.step+1})
+      return allowed(agent)?.has(tool.name)===true
+    }}))}catch(error){releaseTools(agent);throw error}
+  }
   const guard=ctx.tools.guard(exec=>{
     const sid=sidOf(exec),task=runner?.task(sid)
     if(task&&!allowed(exec.agent).has(exec.name))return '当前短任务未授权此工具；只用本平台统一入口。'
+    if(task){const denied=options.maintenance_guard?.(task.batch,exec.name,exec.arguments);if(denied)return denied}
     const chat=qq?.chatForSession(sid)
     const current=context(exec),verifiedAdmin=chat?.startsWith('private:')&&current.owner_authorized===true&&qq?.isTurnAdmin(sid)&&(!options.qq_current_authority||!!options.qq_current_authority(exec,current))
     if(chat&&!task&&!verifiedAdmin){
@@ -119,7 +148,7 @@ export function installNativeRuntimeHooks(ctx,options={}){
     // The official loop assembles before pre-step admission. onRequest keeps
     // the last real position; only a later, already-bound step may close.
     if(task?.input_bound&&task.user_committed&&Number.isSafeInteger(task.step)&&task.step>0)runner?.studyClosing?.(input.agent,{turn:task.turn,step:task.step+1})
-    const assembly=await next(),names=allowed(input?.agent);if(!names)return assembly;const stage=platform(input?.agent);return{...assembly,tools:assembly.tools.filter(tool=>names.has(tool.name)).map(tool=>tool.name==='companion_read'?{...tool,description:nativeReadDescription(stage),parameters:nativeReadParameters(stage)}:tool.name==='companion_persona'?{...tool,parameters:{...tool.parameters,properties:{platform:{type:'string',enum:[stage]}}}}:tool)}
+    const assembly=await next(),names=allowed(input?.agent);if(!names||!Array.isArray(assembly.tools))return assembly;const stage=platform(input?.agent);return{...assembly,tools:scopeNativeToolDefinitions(assembly.tools.filter(tool=>names.has(tool.name)),stage,options.tool_profile?.(task)??{})}
   })
   on('agent/pre-step',async(payload,next)=>{
     if(!store.readOnly)restoreExpiredBudgetOverrides({store,now})
@@ -185,10 +214,10 @@ export function installNativeRuntimeHooks(ctx,options={}){
       }
       for(const port of [options.mood,options.speech,options.references,options.social])Promise.resolve(optional(port,'on_event',session,event)).catch(warn)
       if(event.type==='turn/end')hostContexts.delete(sidOf(session))
-    }catch{warn()}
+    }catch{warn();if(event.type==='turn/end')try{runner?.onSessionEvent(session,event)}catch{warn()}}
   })
   let disposed=false
-  const dispose=()=>{if(disposed)return;disposed=true;for(const off of disposers.splice(0).reverse())off();hostContexts.clear();if(memory.context_resolver===context)memory.context_resolver=oldResolver;installed.delete(ctx)}
+  const dispose=()=>{if(disposed)return;disposed=true;for(const agent of toolScopes.keys())releaseTools(agent);for(const off of disposers.splice(0).reverse())off();hostContexts.clear();if(memory.context_resolver===context)memory.context_resolver=oldResolver;installed.delete(ctx)}
   on('dispose',dispose)
-  const result={context,platform,dispose};installed.set(ctx,result);return result
+  const result={context,platform,scopeTools,releaseTools,dispose};installed.set(ctx,result);return result
 }

@@ -16,6 +16,7 @@ import {canPublishAsset} from './asset-policy.mjs'
 import {redactText} from './memory-rules.mjs'
 import {incomingReplyOrigin} from './publication-origin.mjs'
 import {currentRunScope,withRunScope,assertRunActive,abortableRun} from './run-scope.mjs'
+export {projectNativeBilibiliReadResult} from './read-result-projection.mjs'
 
 const HOST='https://api.bilibili.com',PASSPORT='https://passport.bilibili.com',UA='Mozilla/5.0'
 const sha=value=>createHash('sha256').update(value).digest('hex'),canonical=value=>Array.isArray(value)?value.map(canonical):isPlainObject(value)?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value

@@ -1,3 +1,4 @@
+import {recordNativeMemorySourceBinding} from './memory-provenance.mjs'
 import { randomUUID } from 'node:crypto'
 import { NativeStore } from './store.mjs'
 import { NativeMemory } from './memory.mjs'
@@ -13,7 +14,7 @@ const sidOf = value => value?.agent?.session?.header?.id??value?.agent?.session?
 const sessionOf = value=>value?.agent?.session??value?.session??value
 const textOf = content=>typeof content==='string'?content:Array.isArray(content)?content.filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>block.text).join('\n'):''
 const SOURCE_KIND='plugin:companion-memory'
-const CONTEXT_FIELDS=['session_id','workspace_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','allow_global_summary','memory_only','query','read_memory','write_memory']
+const CONTEXT_FIELDS=['session_id','workspace_id','source_session_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','allow_global_summary','memory_only','query','read_memory','write_memory']
 const SEARCH_FIELDS=['query','platform','conversation_id','since','until','limit','max_chars','entity_id','level','project','goal']
 const WRITE_FIELDS=['content','level','subject','predicate','object','memory_type','evidence_ids','scope','entity_type','actor_uid','actor_entity_id','conversation_id','platform','valid_from','valid_until','correction','supersedes','title','project','importance','keywords','subcategory','goal','corrected']
 const UPDATE_FIELDS=['id','content','object','evidence_ids','memory_type','valid_from','valid_until','importance','keywords','project','goal','title','subcategory','status']
@@ -31,6 +32,7 @@ function normalizeContext(value,sid='') {
   for(const key of ['owner_authorized','include_secret','allow_global_summary','memory_only','read_memory','write_memory'])if(value[key]!==undefined&&typeof value[key]!=='boolean')throw new Error(key+'必须为布尔值')
   if(value.actor_entity_id!==undefined&&value.actor_entity_id!==null)context.actor_entity_id=identifier(value.actor_entity_id,'actor_entity_id')
   if(value.workspace_id!==undefined)context.workspace_id=uid(value.workspace_id,'workspace_id')
+  if(value.source_session_id!==undefined)context.source_session_id=uid(value.source_session_id,'source_session_id')
   if(value.query!==undefined)context.query=automaticMemoryQuery(value.query)
   for(const key of ['read_memory','write_memory'])if(value[key]!==undefined)context[key]=value[key]
   return context
@@ -47,10 +49,11 @@ const compactItems = items=>items.map(row=>Object.fromEntries(['id','source','le
  * message/source text and role labels are never permission input. */
 export class NativeMemoryRuntime {
   constructor(options = {}) {
-    fields(options,['store','context_resolver','now','enabled','settings_document_id','max_injection_chars','human_source_kinds','current_qq_authority'],'NativeMemoryRuntime选项')
+    fields(options,['store','context_resolver','now','enabled','settings_document_id','max_injection_chars','human_source_kinds','current_qq_authority','source_context'],'NativeMemoryRuntime选项')
     if(!(options.store instanceof NativeStore))throw new Error('NativeMemoryRuntime必须显式接收NativeStore')
     if(options.context_resolver!==undefined&&typeof options.context_resolver!=='function'||options.now!==undefined&&typeof options.now!=='function'||options.enabled!==undefined&&typeof options.enabled!=='function'&&typeof options.enabled!=='boolean')throw new Error('原生记忆运行时选项类型无效')
-    this.store=options.store;this.now=options.now??this.store.now;this.memory=new NativeMemory(this.store,{now:this.now});this.context_resolver=options.context_resolver
+    if(options.source_context!==undefined&&typeof options.source_context!=='function')throw new Error('source_context必须为可信宿主函数')
+    this.store=options.store;this.now=options.now??this.store.now;this.memory=new NativeMemory(this.store,{now:this.now});this.context_resolver=options.context_resolver;this.source_context=options.source_context
     if(options.current_qq_authority!==undefined&&typeof options.current_qq_authority!=='function')throw new Error('current_qq_authority必须为可信宿主函数');this.current_qq_authority=options.current_qq_authority
     this.enabled_override=options.enabled;this.settings_document_id=identifier(options.settings_document_id??'settings','settings_document_id')
     this.max_injection_chars=integer(options.max_injection_chars??2200,'max_injection_chars',256,2200)
@@ -103,6 +106,10 @@ export class NativeMemoryRuntime {
     if(consumed){const turn=this.turns.get(sid);if(turn&&!turn.evidence_ids.includes(id))turn.evidence_ids.push(id)}
     if(this.recent.size>512)this.recent.delete(this.recent.keys().next().value)
   }
+  _bindSource(result,sid){
+    if(result.duplicate||!result.evidence)return
+    recordNativeMemorySourceBinding({store:this.store,evidence:result.evidence,context:this.source_context?.(sid,result.evidence)??null,now:this.now})
+  }
   _appendEvidenceEvent(result,event_type) {
     const row=result.evidence
     if(!row)return
@@ -132,6 +139,7 @@ export class NativeMemoryRuntime {
       const result=this.memory.recordEvidence({platform,conversation_id,actor_uid,actor_entity_id:identity.entity_id,direction:'in',kind:'message',text,
         source_message_id:input.source_message_id??'',source_at:input.source_at,source_time_raw:input.source_time_raw??'',visibility:input.visibility??'conversation',source_type:'user',
         source:{kind:'user',explicit:input.explicit??explicitStatement(text),pipeline:'trusted-human-inbound',nickname:display_name}})
+      this._bindSource(result,sid)
       this._appendEvidenceEvent(result,'interaction')
       if(sid){this.contexts.set(sid,{...bound,actor_entity_id:identity.entity_id});this._putRecent(sid,result.id)}
       return {ok:true,id:result.id,status:result.status,confirmation:result.confirmation,duplicate:result.duplicate,actor_entity_id:identity.entity_id}
@@ -150,6 +158,7 @@ export class NativeMemoryRuntime {
         visibility:input.visibility??'owner',source:{kind:action?'server_action':'platform_read',explicit:!action,pipeline:action?'trusted-action-receipt':'trusted-source-read'}})
       // A receipt upgrades the evidence projection; the immutable original
       // journal remains unchanged. Record the new attestation separately.
+      this._bindSource(result,sid)
       if(!result.duplicate)this._appendEvidenceEvent(result,action&&result.status==='confirmed'&&result.evidence.kind!=='receipt'?'experience':action?'log':'platform_read')
       else if(result.evidence.confirmation_evidence_id){const proof=this.memory._rawEvidence(result.evidence.confirmation_evidence_id);this._appendEvidenceEvent({evidence:proof},'log')}
       if(sid)this._putRecent(sid,result.id,{consumed:true})
@@ -279,7 +288,7 @@ export class NativeMemoryRuntime {
     result=this.memory.readEvidence(input,authority)
     if(result.found)return result
     const row=this.store.getJournalEvent(args.id)
-    if(!row||!visible(row,authority))return {found:false,text:'没有该记录或当前上下文无权限。'}
+    if(!row||!this.memory._canJournal(row,authority))return {found:false,text:'没有该记录或当前上下文无权限。'}
     return {found:true,id:row.id,status:row.status,visibility:row.visibility,label:'原始经历/日志；不独立证明正文事实',source_at:row.source_at,source_time_raw:row.source_time_raw,
       ...page(row.text,input),untrusted:true}
   }
@@ -319,6 +328,7 @@ export class NativeMemoryRuntime {
       if(args.actor_uid!==undefined&&args.actor_uid!==context.actor_uid||args.actor_entity_id!==undefined&&args.actor_entity_id!==context.actor_entity_id)throw new Error('人物写入不能切换已消费消息的actor身份')
       write.actor_uid=context.actor_uid;write.actor_entity_id=context.actor_entity_id
     }
+    if(context.memory_only&&context.source_session_id)write.source_session_id=context.source_session_id
     if(write.subject===undefined)write.subject=entity_type==='person'?this.store.getEntity(write.actor_entity_id)?.display_name||write.actor_uid:'记事'
     const result=this.memory.remember(write,permissionContext({...context,allow_global_summary:false}))
     return {ok:true,id:result.id,status:result.status,duplicate:result.duplicate,corrected:result.corrected??[],evidence_ids:result.entry.evidence_ids,

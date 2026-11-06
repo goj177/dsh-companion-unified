@@ -1,5 +1,6 @@
 import { NativeStore } from './store.mjs'
 import {assertTiebaPublishableText} from './tieba-content.mjs'
+import {assertTiebaActionTarget} from './tieba-target.mjs'
 import {NativeRoundPolicy} from './round-policy.mjs'
 import { NativeOutbox,actionVisibility } from './outbox.mjs'
 import { isPlainObject } from './contracts.mjs'
@@ -80,10 +81,17 @@ export class NativeSocial {
     }
     throw new Error('当前会话未获得这个平台或目标的发表权限')
   }
+  _incomingTargets(context){
+    return this.store.db.prepare("SELECT target_json FROM actions WHERE platform=? AND kind='activity.incoming' AND json_extract(metadata_json,'$.execution')='model' AND json_extract(metadata_json,'$.human')=1 AND json_extract(metadata_json,'$.batch_id')=?").all(context.platform,context.task_id).map(row=>JSON.parse(row.target_json))
+  }
+  incomingActionKinds(context={}){
+    if(context.owner_authorized===true||context.can_manage===true||context.autonomous!==true||!['tieba','bilibili'].includes(context.platform)||typeof context.task_id!=='string'||!context.task_id)return null
+    const originals=this._incomingTargets(context);if(!originals.length)return null
+    return [...new Set(originals.map(original=>context.platform==='bilibili'?'bilibili.reply':original.channel==='dm'?'tieba.message':'tieba.reply'))]
+  }
   _incomingTarget(kind,target,context){
-    const rows=this.store.db.prepare("SELECT target_json,metadata_json FROM actions WHERE platform=? AND kind='activity.incoming' AND json_extract(metadata_json,'$.execution')='model' AND json_extract(metadata_json,'$.human')=1 AND json_extract(metadata_json,'$.batch_id')=?").all(context.platform,context.task_id)
-    if(!rows.length)return
-    const originals=rows.map(row=>JSON.parse(row.target_json)),same=(a,b,keys)=>keys.every(key=>typeof a[key]==='string'&&a[key]===b[key])
+    const originals=this._incomingTargets(context);if(!originals.length)return
+    const same=(a,b,keys)=>keys.every(key=>typeof a[key]==='string'&&a[key]===b[key])
     const allowed=originals.some(original=>{
       if(context.platform==='tieba')return original.channel==='dm'
         ?kind==='tieba.message'&&same(target,original,['recipient_uid','conversation_id'])
@@ -125,6 +133,7 @@ export class NativeSocial {
     if(input.kind==='bilibili.reply'&&!['comment','dm','live'].includes(input.target.channel??'comment'))throw new Error('B站回复渠道无效：channel只能为comment、dm或live；回复评论可省略channel')
     const platform=this._authorize(input.kind,input.target,trusted_context),provider=this.providers[platform]
     if(!provider)throw new Error(PLATFORM_LABEL[platform]+'执行器尚未就绪')
+    if(platform==='tieba'&&input.kind!=='tieba.message')assertTiebaActionTarget(input.kind,input.target)
     if(input.kind==='qq.send'){
       if(!provider.prepare)throw new Error('QQ统一准备接口尚未就绪')
       const target=input.target,origin=trusted_context.platform==='qq'&&trusted_context.conversation_id===target.conversation_id?'reply':'proactive'
