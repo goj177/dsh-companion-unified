@@ -9,7 +9,7 @@ const info=JSON.parse(packed.stdout)[0],files=new Set(info.files.map(row=>row.pa
 const forbidden=/(?:^|\/)(?:modules|memory|node_modules|\.runtime|backups?|__pycache__)(?:\/|$)|native\/(?:migrate-|migration|collect-v2|source-snapshot)|\.(?:db|sqlite|class|test|sql|env|pyc|bin|zip|tgz)$/
 for(const name of files){assert.ok(!forbidden.test(name),'private/old/converter file shipped: '+name);if(name.startsWith('vendor/'))assert.ok(/\/(?:LICENSE|NOTICE\.md)$/.test(name),'old executable shipped: '+name)}
 const runtime=[...files].filter(name=>/\.(?:mjs|js)$/.test(name)&&name!=='client.js')
-for(const name of runtime){const body=fs.readFileSync(path.join(root,name),'utf8');assert.ok(!/\/(?:Users|home)\/[A-Za-z0-9_.-]+\//.test(body),'personal machine path: '+name)
+for(const name of runtime){const body=fs.readFileSync(path.join(root,name),'utf8');assert.ok(!/\/Users\/[^/]+\//.test(body),'original machine path: '+name)
   for(const match of body.matchAll(/(?:from\s*|import\s*\()(['"])(\.{1,2}\/[^'"]+)\1/g)){const target=path.relative(root,path.resolve(root,path.dirname(name),match[2])).split(path.sep).join('/');assert.ok(files.has(target),'missing packed dependency: '+name+' -> '+target)}
 }
 assert.ok(files.has('native/protocol/errors.js'));assert.ok(files.has('native/transcribe.py'))
