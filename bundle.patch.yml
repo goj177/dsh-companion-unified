@@ -1,0 +1,4 @@
+# 单一原生服务；共享状态和全部平台通道由同一 Core 管理。
+- insert:
+    - id: companion-unified
+      name: ./index.js

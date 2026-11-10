@@ -1,0 +1,195 @@
+{
+  "name": "dsh-companion-unified",
+  "version": "3.5.21",
+  "description": "欧鲸鲸：原生统一记忆、按需学习、人设、心情与跨平台活动",
+  "private": true,
+  "type": "module",
+  "license": "MIT AND BSD-3-Clause",
+  "main": "index.js",
+  "bin": {
+    "dsh-companion": "./portable-cli.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./portable": "./native/portable.mjs",
+    "./native": "./native/core.mjs",
+    "./bootstrap": "./native/bootstrap.mjs",
+    "./bundle.patch.yml": "./bundle.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "host-peers.mjs",
+    "policy.mjs",
+    "holidays-2026.json",
+    "bundle.patch.yml",
+    "portable-cli.mjs",
+    "native/activity.mjs",
+    "native/scheduled-rounds.mjs",
+    "native/activity-report.mjs",
+    "native/admin-api.mjs",
+    "native/asset-policy.mjs",
+    "native/assets.mjs",
+    "native/bilibili-http.mjs",
+    "native/bilibili-inbox.mjs",
+    "native/bilibili.mjs",
+    "native/bootstrap.mjs",
+    "native/budget.mjs",
+    "native/budget-override.mjs",
+    "native/contacts.mjs",
+    "native/contracts.mjs",
+    "native/core.mjs",
+    "native/defaults.mjs",
+    "native/diary.mjs",
+    "native/learning.mjs",
+    "native/learning-loop.mjs",
+    "native/learning-runtime.mjs",
+    "native/memory-query.mjs",
+    "native/memory-rules.mjs",
+    "native/memory-runtime.mjs",
+    "native/memory.mjs",
+    "native/money-budget.mjs",
+    "native/mood.mjs",
+    "native/hormone.mjs",
+    "native/affect.mjs",
+    "native/input-sources.mjs",
+    "native/outbox.mjs",
+    "native/people.mjs",
+    "native/portable.mjs",
+    "native/profile-service.mjs",
+    "native/qq-bridge-cache.mjs",
+    "native/qq-media.mjs",
+    "native/qq-moderation.mjs",
+    "native/qq-transport.mjs",
+    "native/qq.mjs",
+    "native/read-contracts.mjs",
+    "native/publication-origin.mjs",
+    "native/reference-render.mjs",
+    "native/references.mjs",
+    "native/resources.mjs",
+    "native/runtime-hooks.mjs",
+    "native/run-scope.mjs",
+    "native/secrets.mjs",
+    "native/session-names.mjs",
+    "native/session-runner.mjs",
+    "native/sharing.mjs",
+    "native/social.mjs",
+    "native/source-context.mjs",
+    "native/speech-core.mjs",
+    "native/speech.mjs",
+    "native/store.mjs",
+    "native/tieba-curl.mjs",
+    "native/tieba-http.mjs",
+    "native/tieba-im.mjs",
+    "native/tieba-inbox.mjs",
+    "native/tieba-mentions.mjs",
+    "native/tieba-replies.mjs",
+    "native/tieba-incoming.mjs",
+    "native/tieba.mjs",
+    "native/tieba-content.mjs",
+    "native/tieba-target.mjs",
+    "native/tieba-conversation-style.mjs",
+    "native/tieba-atmosphere.mjs",
+    "native/tools.mjs",
+    "native/tool-scope.mjs",
+    "native/update-check.mjs",
+    "native/zip.mjs",
+    "native/transcribe.py",
+    "native/protocol/*.js",
+    "README.md",
+    "NOTICE.md",
+    "LICENSE",
+    "legal/*.txt",
+    "legal/*.md",
+    "native/round-policy.mjs",
+    "native/memory-consolidation.mjs",
+    "native/memory-provenance.mjs",
+    "native/task-prompt.mjs",
+    "native/tool-schema-projection.mjs",
+    "native/action-result-projection.mjs",
+    "native/read-result-projection.mjs",
+    "native/read-record-view.mjs",
+    "native/tieba-media.mjs",
+    "native/tieba-app-media.mjs",
+    "native/tieba-vision.mjs",
+    "native/bilibili-vision.mjs",
+    "native/image-description.mjs",
+    "native/public-image.mjs",
+    "native/qq-participation.mjs",
+    "native/expression-evolution.mjs",
+    "native/expression-visual.mjs",
+    "native/social-participation.mjs",
+    "native/tieba-media-selection.mjs",
+    "native/persona-export.mjs",
+    "native/tieba-diagnostics.mjs",
+    "native/owner-reports.mjs",
+    "native/tieba-sign-scheduler.mjs",
+    "native/tieba-sign-state.mjs",
+    "native/people-detail.mjs",
+    "native/people-source.mjs",
+    "native/people-summary.mjs"
+  ],
+  "engines": {
+    "node": ">=24",
+    "dsh": ">=0.1.7-rc.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./bundle.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.13",
+    "qrcode": "1.5.4",
+    "ws": "8.22.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "react": "*"
+  },
+  "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "prepack": "node scripts/build-client.mjs",
+    "verify:public": "node scripts/verify-public-release.mjs",
+    "verify:blank": "node scripts/verify-native-blank-initialization.mjs && node scripts/verify-native-defaults.mjs",
+    "verify:package": "node scripts/build-client.mjs --check && node scripts/verify-native-package.mjs"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-typert-protocol": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  }
+}
