@@ -10,6 +10,7 @@ import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-ov
 
 export const MONEY_PRICING_VERSION='deepseek-cny-20261029'
 export const CNY_NANO=1000000000
+export const isMoneyBudgetProvider=provider=>provider==='deepseek-account'||provider==='deepseek'
 const hash=value=>createHash('sha256').update(value).digest('hex'),valid=value=>Number.isSafeInteger(value)&&value>=0
 const billingHolidays=calendar.ranges.flatMap(([a,b])=>{const days=[];for(let at=Date.parse(a+'T00:00:00Z');at<=Date.parse(b+'T00:00:00Z');at+=86400000)days.push(new Date(at).toISOString().slice(0,10));return days})
 const billingPhase=at=>valleyDecision(at,{holidays:billingHolidays})
@@ -80,7 +81,7 @@ export class NativeMoneyBudget{
   reserve(request,{scope='qq',platform='qq'}={}){
     this._restore()
     if(!this.enabled())return null
-    if(!['deepseek-account','deepseek'].includes(request.provider)||!moneyRates(request.model))throw new MoneyBudgetError('当前模型单价尚未核验，费用预算已阻止新调用','unknown_model')
+    if(!isMoneyBudgetProvider(request.provider)||!moneyRates(request.model))throw new MoneyBudgetError('当前模型单价尚未核验，费用预算已阻止新调用','unknown_model')
     return this.store.transaction(()=>{
       this.recover();const at=this.now(),policy=this._policy(),phase=billingPhase(at),rates=moneyRates(request.model,phase.peak),bound=moneyRequestBound(request,moneyRates(request.model,true)),status=this.status()
       if(bound.nano>status.remaining_nano)throw Object.assign(new MoneyBudgetError('日上限¥'+(status.limit_nano/1e9).toFixed(2)+'；已核算¥'+(status.known_nano/1e9).toFixed(4)+'，待核对占额¥'+(status.uncertain_nano/1e9).toFixed(4)+'，进行中预留¥'+(status.reserved_nano/1e9).toFixed(4)+'；本次还需预留¥'+(bound.nano/1e9).toFixed(4)+'，可用额度不足。预留不是已消费。',status.reserved_nano>0&&bound.nano<=status.remaining_nano+status.reserved_nano?'inflight':'budget'),{required_nano:bound.nano})

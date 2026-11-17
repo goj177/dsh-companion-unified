@@ -1,8 +1,12 @@
 import { NativeStore } from './store.mjs'
-import {assertTiebaPublishableText} from './tieba-content.mjs'
-import {assertTiebaActionTarget,tiebaReplyPaused} from './tieba-target.mjs'
-import {checkedTiebaEmotes} from './tieba-media.mjs'
+import {assertTiebaActionTarget,tiebaBarRepliesIgnored,tiebaReplyPaused,tiebaThreadReplyPaused} from './tieba-target.mjs'
+import {checkedTiebaEmotes,assertTiebaPublishableBody} from './tieba-media.mjs'
+import {normalizeTiebaReplyEmotes} from './tieba-content.mjs'
+import {decodeTiebaPublicText,encodeTiebaPublicText,tiebaThreadUsesEncryptedReplies} from './tieba-encoded-text.mjs'
+import {outboundAllowed} from './tieba-http.mjs'
+import {redactText} from './memory-rules.mjs'
 import {NativeRoundPolicy} from './round-policy.mjs'
+import {hasContextualTiebaReplyDecision} from './social-participation.mjs'
 import { NativeOutbox,actionVisibility } from './outbox.mjs'
 import { isPlainObject } from './contracts.mjs'
 import {NativeSharing,isCompletedShareIntent,SharingPolicyError} from './sharing.mjs'
@@ -55,6 +59,8 @@ export class NativeSocial {
       if(kind==='bilibili.share'&&cfg.bilibili?.sharing?.enabled!==true)throw new Error('B站分享已关闭')
     }
     if(platform==='tieba'){
+      if(kind==='tieba.reply'&&tiebaBarRepliesIgnored(cfg.tieba,target.bar))throw new Error('主人已永久忽略此吧来信，已跳过回复')
+      if(kind==='tieba.reply'&&tiebaThreadReplyPaused(cfg.tieba,target.thread_id,this._now()))throw new Error('主人已暂停回复此贴吧帖子')
       if(kind==='tieba.reply'&&tiebaReplyPaused(cfg.tieba,target.reply_uid,this._now()))throw new Error('主人已临时暂停回复此贴吧账号')
       const flag=kind==='tieba.message'?'direct_message':kind==='tieba.post'?'new_thread':kind==='tieba.reply'?'reply':kind==='tieba.sign'?'sign':'follow'
       if(permissions[flag]!==true)throw new Error('贴吧对应操作已关闭')
@@ -92,6 +98,17 @@ export class NativeSocial {
     const originals=this._incomingTargets(context);if(!originals.length)return null
     return [...new Set(originals.map(original=>context.platform==='bilibili'?'bilibili.reply':original.channel==='dm'?'tieba.message':'tieba.reply'))]
   }
+  _checkAutonomousFunnyFace(input,context){
+    if(context.autonomous!==true||input.kind!=='tieba.reply'||!input.target.emotes?.includes('滑稽'))return
+    // intent is the model's own declaration, not an independent understanding
+    // of the conversation. Retain a separate history guard against repetition.
+    if(input.target.intent!=='joke')throw new Error('滑稽仅用于本次声明为玩笑的回复；请重新判断本条的用途和表情')
+    const since=this._now()-30*60*1000
+    const rows=this.store.db.prepare("SELECT target_json FROM actions WHERE platform='tieba' AND kind='tieba.reply' AND status='confirmed' AND confirmed_at>=? ORDER BY confirmed_at DESC,rowid DESC LIMIT 4").all(since)
+    if(rows.some(row=>JSON.parse(row.target_json).emotes?.includes('滑稽')))throw new Error('近期回复已使用或正在发送滑稽，请选择当前场合合适的表达')
+    const pending=this.store.db.prepare("SELECT target_json FROM actions WHERE platform='tieba' AND kind='tieba.reply' AND created_at>=? AND status IN ('queued','leased','submitting','unknown')").all(since)
+    if(pending.some(row=>JSON.parse(row.target_json).emotes?.includes('滑稽')))throw new Error('已有滑稽回复待发送或结果未确认，请选择当前场合合适的表达')
+  }
   _incomingTarget(kind,target,context){
     const originals=this._incomingTargets(context);if(!originals.length)return
     const same=(a,b,keys)=>keys.every(key=>typeof a[key]==='string'&&a[key]===b[key])
@@ -109,8 +126,19 @@ export class NativeSocial {
     })
     if(!allowed)throw new Error('这轮是对真实来信的回应，只能回复原对象和原位置；引用、楼主经历或@其他人的话不授予新任务权限')
   }
+  _requireIncomingDecision(kind,target,context){
+    if(kind!=='tieba.reply'||context.platform!=='tieba'||context.autonomous!==true||context.owner_authorized===true||context.can_manage===true||!context.task_id)return
+    const candidates=this.store.db.prepare("SELECT id,target_json,metadata_json,source_evidence_id FROM actions WHERE platform='tieba' AND kind='activity.incoming' AND json_extract(metadata_json,'$.execution')='model' AND json_extract(metadata_json,'$.human')=1 AND json_extract(metadata_json,'$.batch_id')=?").all(context.task_id)
+    if(!candidates.length)return // Autonomous exploration is not an incoming batch.
+    const matches=candidates.filter(row=>{const source=JSON.parse(row.target_json);return source.channel==='comment'&&['bar','thread_id','post_id','sub_reply_id'].every(key=>(source[key]??'')===(target[key]??''))&&(source.sub_reply_id?source.reply_uid===target.reply_uid:!target.reply_uid||target.reply_uid===(source.actor_uid??source.reply_uid))})
+    if(matches.length!==1)throw new Error('当前回复无法唯一对应本轮真实来信')
+    const row=matches[0],metadata=JSON.parse(row.metadata_json)
+    if(metadata.trigger==='manual')return
+    if(!hasContextualTiebaReplyDecision(this.store,{incoming_task_id:row.id,task_id:context.task_id,session_id:context.session_id??'',source_evidence_id:row.source_evidence_id}))throw new Error('请先根据上下文确认实际谈话对象是自己，并为这条来信选择reply，才可准备发表')
+  }
   async prepare(input,trusted_context={}){
     const result=await this._prepare(input,trusted_context)
+    if(result.duplicate&&trusted_context.round_id&&new NativeRoundPolicy({store:this.store,platform:'tieba',now:this.now}).bar(trusted_context.round_id)&&result.action.metadata?.prepared_in?.round_id!==trusted_context.round_id)throw new Error('指定贴吧轮次不能复用其他轮次的动作')
     if(!result.duplicate&&input.kind==='qq.send'&&trusted_context.can_manage_qq&&input.target.conversation_id!==trusted_context.conversation_id){
       if(!this.providers.qq.managementAuthority(trusted_context,result.action.target))throw new Error('当前管理员群发授权已失效')
       this.store.transaction(()=>{const action=this.outbox.get(result.action.id,{internal:true}),source=Object.fromEntries(['platform','conversation_id','session_id','actor_uid','source_scope'].map(key=>[key,trusted_context[key]]));this.store.db.prepare('UPDATE actions SET metadata_json=? WHERE id=?').run(JSON.stringify({...action.metadata,qq_management:source}),action.id)})
@@ -127,6 +155,7 @@ export class NativeSocial {
   async _prepare(input,trusted_context={}){
     fields(input,['kind','target','body','idempotency_key','source_evidence_id','not_before'])
     if(!KINDS.has(input.kind)||!isPlainObject(input.target))throw new Error('社交操作或目标无效')
+    if(input.kind==='tieba.reply'&&typeof input.body==='string')input={...input,body:normalizeTiebaReplyEmotes(input.body)}
     if(isQQModeration(input.kind)){
       if(input.body!==undefined&&input.body!=='')throw new Error('禁言与解禁不发表正文，请将body置空')
       input={...input,target:normalizeQQModerationTarget(input.kind,input.target,trusted_context),body:''}
@@ -135,6 +164,9 @@ export class NativeSocial {
     if(input.kind==='bilibili.share'&&!['qq','comment','dynamic','dm','live'].includes(input.target.via))throw new Error('B站分享渠道无效：via只能为qq、comment、dynamic、dm或live；分享给主人请用via=qq、destination=owner')
     if(input.kind==='bilibili.reply'&&!['comment','dm','live'].includes(input.target.channel??'comment'))throw new Error('B站回复渠道无效：channel只能为comment、dm或live；回复评论可省略channel')
     const platform=this._authorize(input.kind,input.target,trusted_context),provider=this.providers[platform]
+    const boundRound=trusted_context.round_id&&new NativeRoundPolicy({store:this.store,platform:'tieba',now:this.now}),boundBar=boundRound&&boundRound.bar(trusted_context.round_id)
+    if(boundBar){if(platform!=='tieba'||input.kind!=='tieba.reply'||!boundRound.hasRead(trusted_context.round_id,input.target.thread_id))throw new Error('指定贴吧轮次只允许回复本轮已读帖子');boundRound.assertBar(trusted_context.round_id,input.target.bar);boundRound.assertBar(trusted_context.round_id,provider?._knownForum?.(input.target.thread_id));boundRound.assertNotCancelled(trusted_context.round_id,input.target,input.body)}
+    this._requireIncomingDecision(input.kind,input.target,trusted_context)
     if(!provider)throw new Error(PLATFORM_LABEL[platform]+'执行器尚未就绪')
     if(platform==='tieba'&&input.kind!=='tieba.message'){assertTiebaActionTarget(input.kind,input.target);checkedTiebaEmotes(input.target.emotes??[])}
     if(input.kind==='qq.send'){
@@ -153,10 +185,33 @@ export class NativeSocial {
       return provider.prepareModeration({operation:input.kind==='qq.mute'?'mute':'unmute',...input.target,idempotency_key:input.idempotency_key,...(input.source_evidence_id?{source_evidence_id:input.source_evidence_id}:{})},trusted_context)
     }
     if(typeof input.body!=='string')throw new Error('请提供完整正文；不自动改写已准备内容')
-    if(platform==='tieba'&&['tieba.reply','tieba.post'].includes(input.kind))assertTiebaPublishableText(input.body)
+    if(trusted_context.autonomous===true&&input.kind==='tieba.reply'&&input.target.intent!=='joke'&&input.body.trim()&&input.target.emotes?.includes('滑稽')){
+      // A declined decoration must not block an otherwise valid text reply.
+      const {emotes,...target}=input.target,allowed=emotes.filter(name=>name!=='滑稽')
+      input={...input,target:allowed.length?{...target,emotes:allowed}:target}
+    }
+    if(platform==='tieba'&&['tieba.reply','tieba.post'].includes(input.kind))assertTiebaPublishableBody(input.body,input.target.emotes??[],{reply:input.kind==='tieba.reply'})
+    if(input.kind==='tieba.post'&&input.target.encrypt_replies===true){
+      if(!trusted_context.owner_authorized&&!trusted_context.can_manage)throw new Error('仅主人授权可为主题启用加密回帖')
+      const plaintext=decodeTiebaPublicText(input.body,{redact:false})
+      if(plaintext===null||!outboundAllowed(plaintext)||redactText(plaintext)!==plaintext)throw new Error('加密帖缺少可公开发表的加密正文')
+    }
+    if(input.kind==='tieba.reply'&&tiebaThreadUsesEncryptedReplies(this.store,input.target.thread_id)){
+      return this.store.transaction(()=>{
+        const decoded=decodeTiebaPublicText(input.body,{redact:false}),plain=decoded??input.body
+        if(input.target.asset_ids?.length||input.target.emotes?.length)throw new Error('这篇只发表加密文字回帖，请移除图片及独立表情')
+        if(!plain.trim()||!outboundAllowed(plain)||redactText(plain)!==plain)throw new Error('加密回帖正文为空或含私密内容')
+        assertTiebaPublishableBody(plain,[],{reply:true})
+        const previous=input.idempotency_key&&this.outbox.getByIdempotencyKey(platform,input.idempotency_key)
+        const body=decoded!==null?input.body:previous&&decodeTiebaPublicText(previous.body)===plain?previous.body:encodeTiebaPublicText(plain)
+        if(body.length>(input.target.post_id?300:400))throw new Error('加密后超过贴吧长度限制，楼中楼请把正文缩至约 17 个汉字再试')
+        return this.outbox.prepare({platform,kind:input.kind,target:input.target,body,idempotency_key:input.idempotency_key,
+          source_evidence_id:input.source_evidence_id,not_before:input.not_before,approval:'required'})
+      })
+    }
     if(input.kind==='bilibili.share'&&input.target.via==='qq')return this.sharing.prepare(input,trusted_context)
     const result=this.outbox.prepare({platform,kind:input.kind,target:input.target,body:input.body,idempotency_key:input.idempotency_key,
-      source_evidence_id:input.source_evidence_id,not_before:input.not_before,approval:'required'})
+      source_evidence_id:input.source_evidence_id,not_before:input.not_before,approval:'required'}, {validateNew:()=>this._checkAutonomousFunnyFace(input,trusted_context)})
     if(input.kind==='bilibili.share')result.action=this.sharing.decorate(result.action,trusted_context)
     return result
   }
@@ -164,6 +219,8 @@ export class NativeSocial {
     return this.store.transaction(()=>{
       const action=this.outbox.get(action_id,{internal:true});if(!action)throw new Error('草稿不存在')
       this._authorize(action.kind,action.target,trusted_context)
+      const boundRound=action.metadata?.prepared_in?.round_id&&new NativeRoundPolicy({store:this.store,platform:'tieba',now:this.now}),scope=action.metadata?.prepared_in?.round_id
+      if(boundRound?.bar(scope)){if(action.kind!=='tieba.reply'||!boundRound.hasRead(scope,action.target.thread_id))throw new Error('指定贴吧轮次只允许回复本轮已读帖子');boundRound.assertBar(scope,action.target.bar);boundRound.assertBar(scope,this.providers.tieba?._knownForum?.(action.target.thread_id));boundRound.assertNotCancelled(scope,action.target,action.body)}
       if(action.status==='draft'&&['tieba','bilibili'].includes(action.platform))new NativeRoundPolicy({store:this.store,platform:action.platform,now:this.now}).checkApproval(action)
       return this.outbox.approve(action_id,{expected_digest})
     })

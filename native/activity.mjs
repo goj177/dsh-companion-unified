@@ -1,4 +1,5 @@
 import { randomUUID,createHash } from 'node:crypto'
+import {canonicalBar} from './tieba-atmosphere.mjs'
 import { NativeStore } from './store.mjs'
 import { NativeBudget } from './budget.mjs'
 import {NativeOutbox,nativeProcessLeaseOwner} from './outbox.mjs'
@@ -7,6 +8,9 @@ import { shanghaiTime,valleyDecision } from '../policy.mjs'
 import {isCompletedShareIntent} from './sharing.mjs'
 import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
 import {nativeTaskClues,INCOMING_BATCH_CLUE_CHARS} from './task-prompt.mjs'
+import {tiebaBarRepliesIgnored,tiebaThreadReplyPaused} from './tieba-target.mjs'
+import {qqProactiveTargets} from './protocol/chat.js'
+import {isMoneyBudgetProvider} from './money-budget.mjs'
 
 const PLATFORMS=['qq','tieba','bilibili']
 const KINDS=['explore','incoming','chat','maintenance']
@@ -24,6 +28,13 @@ const canonical=value=>Array.isArray(value)?value.map(canonical):isPlainObject(v
 const encode=value=>stringifyJson(canonical(validateJson(value)))
 // Public inbox work has its own queue. It must not keep pushing back idle opportunities.
 const monitoredIncoming=task=>task.kind==='activity.incoming'&&task.metadata?.trigger==='incoming'&&['tieba','bilibili'].includes(task.platform)
+function directedTiebaIncoming(task){
+  if(task.platform!=='tieba'||task.kind!=='activity.incoming'||task.metadata.execution!=='model'||task.target.channel!=='comment'||!task.metadata.public_context)return false
+  try{
+    const source=JSON.parse(task.metadata.public_context).source_context
+    return source?.addressed_to_self===true&&['explicit_reply_uid','verified_sub_reply_quote','verified_post_quote','structured_mention_uid'].includes(source.recipient_verification)
+  }catch{return false}
+}
 function targetOf(value){
   const result=validateJson(value,{object:true,maxBytes:512*1024})
   const visit=input=>{if(!isPlainObject(input)&&!Array.isArray(input))return;for(const [key,child]of Object.entries(input)){
@@ -53,15 +64,17 @@ function quietDecision(now,config){
  * public-send implementation exists in this module. */
 export class NativeActivity {
   constructor(options={}){
-    fields(options,['store','budget','money_budget','runner','publication_runner','model_gate','background_model','now','activity_document_id','state_document_id'])
+    fields(options,['store','budget','money_budget','runner','publication_runner','model_gate','background_model','now','activity_document_id','state_document_id','dsh_model'])
     if(!(options.store instanceof NativeStore))throw new Error('NativeActivity必须显式使用NativeStore')
     if(options.now!==undefined&&typeof options.now!=='function'||options.runner!==undefined&&typeof options.runner!=='function'||options.publication_runner!==undefined&&typeof options.publication_runner!=='function'||options.model_gate!==undefined&&typeof options.model_gate!=='function'||options.background_model!==undefined&&typeof options.background_model!=='function')throw new Error('活动时钟、准入检查或runner必须为函数')
     this.store=options.store;this.now=options.now??this.store.now;this.policy_id=text(options.activity_document_id??'activity','activity_document_id',160,true)
     this.state_id=text(options.state_document_id??'activity:state','state_document_id',160,true)
     this.budget=options.budget??new NativeBudget({store:this.store,now:this.now,policy_document_id:this.policy_id})
     if(!(this.budget instanceof NativeBudget)||this.budget.store!==this.store||this.budget.policyId!==this.policy_id)throw new Error('NativeActivity预算必须使用同一个NativeStore和活动策略')
-    this.runner=options.runner;this.publication_runner=options.publication_runner;this.model_gate=options.model_gate;this.background_model=options.background_model;this.money=options.money_budget;if(this.money&&this.money.store!==this.store)throw new Error('费用预算必须同库')
+    if(options.dsh_model!==undefined&&typeof options.dsh_model!=='function')throw new Error('DSH 模型选择必须由宿主提供')
+    this.runner=options.runner;this.publication_runner=options.publication_runner;this.model_gate=options.model_gate;this.background_model=options.background_model;this.money=options.money_budget;this.dsh_model=options.dsh_model;if(this.money&&this.money.store!==this.store)throw new Error('费用预算必须同库')
   }
+  moneyBudgetEnabled(){return this.money?.enabled()===true&&(!this.dsh_model||isMoneyBudgetProvider(this.dsh_model()?.provider))}
   _now(){this.store._open();return time(this.now(),'活动时钟')}
   _policy(){const doc=this.store.getDocument(this.policy_id);if(doc&&doc.type!=='activity')throw new Error('活动策略文档类型无效');return effectiveActivityPolicy({store:this.store,document_id:this.policy_id,now:this.now})}
   _state(){
@@ -98,7 +111,7 @@ export class NativeActivity {
     if(kind==='activity.explore'){
       // A started, blocked model round has ended. Keep its outcome frozen;
       // a later fresh round still passes current gates and has its own key.
-      const old=this._list(OPEN).find(row=>row.platform===platform&&row.kind===kind&&!(row.status==='blocked'&&(row.metadata.dispatch_started||row.metadata.model_started))&&(!target.round_limits||encode(row.target.round_limits??{})===encode(target.round_limits)))
+      const old=this._list(OPEN).find(row=>row.platform===platform&&row.kind===kind&&!(row.status==='blocked'&&(row.metadata.dispatch_started||row.metadata.model_started))&&(row.target.bar??'')===(target.bar??'')&&(!target.round_limits||encode(row.target.round_limits??{})===encode(target.round_limits)))
       if(old){
         if(trigger==='manual'&&old.status==='queued'&&!old.metadata.dispatch_started&&!old.metadata.model_started&&old.metadata.trigger!=='manual'){
           const metadata={...old.metadata,trigger:'manual',last_error:''}
@@ -140,11 +153,13 @@ export class NativeActivity {
   }
   enqueue(input){this.store._write();if(input?.execution!==undefined||input?.initial_status!==undefined)throw new Error('通用enqueue不接受执行器或审批状态覆盖');return this.store.transaction(()=>this._enqueue(input))}
   runOneRound(platform,options={}){
-    fields(options,['trigger','read_per_round','reply_per_round','idempotency_key']);const trigger=options.trigger??'manual'
+    fields(options,['trigger','read_per_round','reply_per_round','idempotency_key','bar']);const trigger=options.trigger??'manual'
     choice(platform,['tieba','bilibili'],'探索平台');choice(trigger,['manual','autonomous'],'trigger')
     const limits={};for(const key of ['read_per_round','reply_per_round'])if(options[key]!==undefined)limits[key]=integer(options[key],key,key==='read_per_round'?1:0,30)
     if(Object.keys(limits).length&&trigger!=='manual')throw new Error('单轮覆盖仅限主人手动发起')
-    return this.enqueue({platform,kind:'explore',trigger,target:{autonomous:true,...(Object.keys(limits).length?{round_limits:limits}:{})},human:false,heavy:true,...(options.idempotency_key?{idempotency_key:options.idempotency_key}:{})})
+    if(options.bar!==undefined&&(platform!=='tieba'||trigger!=='manual'))throw new Error('指定贴吧仅限主人手动发起')
+    const bar=options.bar===undefined?'':canonicalBar(options.bar)
+    return this.enqueue({platform,kind:'explore',trigger,target:{autonomous:true,...(bar?{bar}:{}),...(Object.keys(limits).length?{round_limits:limits}:{})},human:false,heavy:true,...(options.idempotency_key?{idempotency_key:options.idempotency_key}:{})})
   }
   enqueuePublication(input){
     this.store._write();fields(input,['platform','action_id','idempotency_key'])
@@ -206,19 +221,21 @@ export class NativeActivity {
       return {platform,blocked:false}
     })
   }
-  _gate(task,state,p,{include_batch=true}={}){
+  _gate(task,state,p,{include_batch=true,model_gate_cache}={}){
     const now=this._now(),phase=valleyDecision(now,p)
     if(p.enabled!==true)return {reason:'disabled',next_eligible_at:null}
     const block=this._block(state,task.platform)
     if(block)return {reason:'platform_blocked',next_eligible_at:block.until??null,detail:block.reason}
     const platformState=this.store.getDocument('platform-state-'+task.platform)?.value
     if(platformState?.verification_required||platformState?.paused_until>now)return{reason:'platform_blocked',next_eligible_at:platformState.verification_required?null:platformState.paused_until,detail:platformState.verification_reason??'平台要求核验或退避'}
-    if(task.metadata.execution==='model'){const gate=this.model_gate?.(task);if(gate)return gate}
+    if(this._barReplyIgnored(task))return {reason:'owner_bar_ignored',next_eligible_at:null}
+    if(this._threadReplySkipped(task))return {reason:'owner_thread_skipped',next_eligible_at:null}
+    if(task.metadata.execution==='model'){const gate=this.model_gate?.(task,model_gate_cache);if(gate)return gate}
     const maintenance=task.kind==='activity.maintenance'&&task.metadata.execution==='model'&&['memory','mood','learning','people'].includes(task.target.maintenance_kind)
     if(task.platform==='qq'&&!task.metadata.human&&!maintenance){const quiet=quietDecision(now,p);if(quiet.quiet)return {reason:'qq_quiet',next_eligible_at:quiet.next_at}}
     if(task.not_before>now)return {reason:'not_before',next_eligible_at:task.not_before}
     if(task.metadata.execution!=='publication'){
-      if(this.money?.enabled()){const cash=this.money.status();if(cash.remaining_nano<(task.metadata.required_cost_nano??1))return{reason:'money_budget',next_eligible_at:shanghaiTime(now).midnight+86400000}}
+      if(this.moneyBudgetEnabled()){const cash=this.money.status();if(cash.remaining_nano<(task.metadata.required_cost_nano??1))return{reason:'money_budget',next_eligible_at:shanghaiTime(now).midnight+86400000}}
       const urgent=task.metadata.human&&!task.metadata.heavy&&p.budget?.urgent_human_allowed===true
       const manual=task.metadata.trigger==='manual'
       if(!phase.valley&&!urgent&&!manual)return {reason:'peak',next_eligible_at:phase.nextValleyAt}
@@ -228,20 +245,54 @@ export class NativeActivity {
     if(include_batch&&task.created_at+delay>now)return {reason:'batching',next_eligible_at:task.created_at+delay}
     return {reason:'ready',next_eligible_at:now}
   }
+  _barReplyIgnored(task){
+    if(task.platform!=='tieba'||task.kind!=='activity.incoming'||task.metadata.execution!=='model'||task.target.channel!=='comment')return false
+    return tiebaBarRepliesIgnored(this.store.getDocument('tieba')?.value.tieba,task.target.bar)
+  }
+  _threadReplySkipped(task){
+    if(task.platform!=='tieba'||task.kind!=='activity.incoming'||task.metadata.execution!=='model'||task.metadata.human!==true||task.target.channel!=='comment'||!task.target.thread_id)return false
+    const source=task.source_evidence_id?this.store.db.prepare("SELECT source_at FROM evidence WHERE id=? AND platform='tieba' AND direction='in' AND source_type='user'").get(task.source_evidence_id):null
+    return tiebaThreadReplyPaused(this.store.getDocument('tieba')?.value.tieba,task.target.thread_id,this._now(),source?.source_at,{unknown_source_blocks:true})
+  }
+  _priorityTiebaReplies(tasks){
+    const priority=new Set()
+    if(!tasks.some(task=>task.platform==='tieba'&&task.kind==='activity.incoming'))return priority
+    const uids=new Set(this.store.db.prepare("SELECT platform_uid FROM platform_identities WHERE namespace='tieba' AND role='person' AND json_type(metadata_json,'$.owner_priority_reply')='true'").all().map(row=>row.platform_uid))
+    if(!uids.size)return priority
+    const source=this.store.db.prepare("SELECT 1 FROM evidence WHERE id=? AND platform='tieba' AND direction='in' AND source_type='user' AND visibility='public' AND actor_uid=? AND conversation_id=? AND text=?")
+    const original=this.store.db.prepare(`SELECT json_extract(a.target_json,'$.actor_uid') uid
+      FROM actions a JOIN evidence e ON e.id=a.source_evidence_id AND e.actor_uid=json_extract(a.target_json,'$.actor_uid')
+      WHERE a.platform='tieba' AND a.kind='activity.incoming' AND json_extract(a.metadata_json,'$.execution')='model'
+      AND json_extract(a.metadata_json,'$.batch_id')=? AND json_extract(a.target_json,'$.channel')='comment'
+      AND json_extract(a.target_json,'$.thread_id')=? AND json_extract(a.target_json,'$.post_id')=?
+      AND coalesce(json_extract(a.target_json,'$.sub_reply_id'),'')=?
+      AND e.platform='tieba' AND e.direction='in' AND e.source_type='user' AND e.visibility='public'
+      AND e.conversation_id=json_extract(a.target_json,'$.conversation_id') AND e.text=a.body LIMIT 2`)
+    for(const task of tasks){
+      if(task.platform!=='tieba'||task.kind!=='activity.incoming')continue
+      if(task.metadata.execution==='publication'){
+        let linked
+        try{linked=this._publication(task)}catch{continue}
+        if(linked.kind!=='tieba.reply')continue
+        const target=linked.target
+        const batch=linked.metadata.prepared_in?.round_id
+        const matches=!target.reply_uid&&batch&&target.post_id?original.all(batch,target.thread_id,target.post_id,target.sub_reply_id??''):[]
+        if(uids.has(target.reply_uid)||matches.length===1&&uids.has(matches[0].uid))priority.add(task.id)
+      }else if(task.metadata.human===true&&task.target.channel==='comment'&&uids.has(task.target.actor_uid)&&source.get(task.source_evidence_id,task.target.actor_uid,task.target.conversation_id,task.body))priority.add(task.id)
+    }
+    return priority
+  }
   _idle(state,p){
     const now=this._now(),cfg=p.idle??{},phase=valleyDecision(now,p)
-    if(p.enabled!==true||cfg.enabled!==true||this.money?.enabled()&&this.money.status().remaining_nano<=0||!phase.valley||now-state.value.idle.last_activity_at<(cfg.min_idle_ms??2700000))return
+    if(p.enabled!==true||cfg.enabled!==true||this.moneyBudgetEnabled()&&this.money.status().remaining_nano<=0||!phase.valley||now-state.value.idle.last_activity_at<(cfg.min_idle_ms??2700000))return
     const pending=[...this._list(['queued','leased','running']),...this._list(['blocked']).filter(task=>task.kind==='activity.explore'&&!task.metadata.dispatch_started&&!task.metadata.model_started)],active=pending.filter(task=>ACTIVE.includes(task.status)),models=active.filter(task=>task.metadata.execution==='model')
     const foreground=models.filter(task=>!monitoredIncoming(task))
-    if(new Set(foreground.map(task=>task.metadata.batch_id||task.id)).size>=(p.batching?.max_concurrent??1)||pending.some(task=>task.status==='queued'&&task.metadata.execution==='model'&&!monitoredIncoming(task)&&new Set(models.filter(row=>row.platform===task.platform).map(row=>row.metadata.batch_id||row.id)).size<(p.batching?.max_per_platform??1)&&this._gate(task,state,p,{include_batch:false}).reason==='ready'))return
+    const gateOptions={include_batch:false,model_gate_cache:new Map()}
+    if(new Set(foreground.map(task=>task.metadata.batch_id||task.id)).size>=(p.batching?.max_concurrent??1)||pending.some(task=>task.status==='queued'&&task.metadata.execution==='model'&&!monitoredIncoming(task)&&new Set(models.filter(row=>row.platform===task.platform).map(row=>row.metadata.batch_id||row.id)).size<(p.batching?.max_per_platform??1)&&this._gate(task,state,p,gateOptions).reason==='ready'))return
     const choices=[]
-    const platforms=(cfg.explore_platforms??['bilibili','tieba']).filter(platform=>{const provider=this.store.getDocument('platform-state-'+platform)?.value;return ['tieba','bilibili'].includes(platform)&&!this._block(state,platform)&&!provider?.verification_required&&!(provider?.paused_until>now)&&!pending.some(task=>task.platform===platform&&task.metadata.execution==='model'&&!monitoredIncoming(task)&&(task.kind!=='activity.incoming'||ACTIVE.includes(task.status)||['ready','batching'].includes(this._gate(task,state,p,{include_batch:false}).reason)))})
+    const platforms=(cfg.explore_platforms??['bilibili','tieba']).filter(platform=>{const provider=this.store.getDocument('platform-state-'+platform)?.value;return ['tieba','bilibili'].includes(platform)&&!this._block(state,platform)&&!provider?.verification_required&&!(provider?.paused_until>now)&&!pending.some(task=>task.platform===platform&&task.metadata.execution==='model'&&!monitoredIncoming(task)&&(task.kind!=='activity.incoming'||ACTIVE.includes(task.status)||['ready','batching'].includes(this._gate(task,state,p,gateOptions).reason)))})
     if(platforms.length&&now>=state.value.idle.next_explore_at)choices.push({kind:'explore',at:state.value.idle.next_explore_at})
-    const chats=[]
-    for(const target of cfg.qq_targets??['owner','group']){
-      if(target==='owner'&&p.qq?.owner_conversation)chats.push({target,conversation_id:p.qq.owner_conversation})
-      if(target==='group')for(const conversation_id of p.qq?.group_conversations??[])chats.push({target,conversation_id})
-    }
+    const chats=qqProactiveTargets(p)
     if(chats.length&&!pending.some(task=>task.platform==='qq')&&!this._block(state,'qq')&&!quietDecision(now,p).quiet&&now>=state.value.idle.next_chat_at)choices.push({kind:'chat',at:state.value.idle.next_chat_at})
     const next=choices.sort((a,b)=>a.at-b.at)[0]
     if(next?.kind==='explore'){
@@ -314,7 +365,14 @@ export class NativeActivity {
       if(p.enabled!==true)return {reason:'disabled'}
       if(idle)this._idle(state,p)
       const active=this._list(ACTIVE),models=active.filter(task=>task.metadata.execution==='model')
-      const queued=this._list(['queued']).filter(task=>(platform===undefined||task.platform===platform)&&(execution===undefined||task.metadata.execution===execution)),ready=queued.filter(task=>this._gate(task,state,p).reason==='ready')
+      const candidates=this._list(['queued']).filter(task=>(platform===undefined||task.platform===platform)&&(execution===undefined||task.metadata.execution===execution)),queued=[]
+      for(const task of candidates){
+        if(this._barReplyIgnored(task))this._finishInvalid(task,'主人已永久忽略此吧来信，已跳过回复','cancelled')
+        else if(this._threadReplySkipped(task))this._finishInvalid(task,'主人暂停此帖，截止前来信跳过且不补回','cancelled')
+        else queued.push(task)
+      }
+      const gateOptions={model_gate_cache:new Map()}
+      const ready=queued.filter(task=>this._gate(task,state,p,gateOptions).reason==='ready')
       const dueExploration=new Set()
       for(const task of ready.filter(task=>task.kind==='activity.explore'&&task.metadata.trigger==='autonomous')){
         const previous=this.store.db.prepare("SELECT kind,metadata_json,platform FROM actions WHERE platform=? AND json_extract(metadata_json,'$.record_type')='activity_task' AND json_extract(metadata_json,'$.execution')='model' AND json_extract(metadata_json,'$.model_started')=1 AND json_extract(metadata_json,'$.completed_at')>=? ORDER BY json_extract(metadata_json,'$.completed_at') DESC,rowid DESC LIMIT 1").get(task.platform,task.created_at)
@@ -322,7 +380,9 @@ export class NativeActivity {
       }
       // Once an inbox batch finishes, let an already-due exploration take its
       // turn. Continuous new replies cannot starve that platform indefinitely.
-      ready.sort((a,b)=>Number(b.metadata.execution==='publication')-Number(a.metadata.execution==='publication')||Number(b.metadata.trigger==='manual')-Number(a.metadata.trigger==='manual')||Number(dueExploration.has(b.id))-Number(dueExploration.has(a.id))||Number(b.metadata.human)-Number(a.metadata.human)||a.created_at-b.created_at||a.id.localeCompare(b.id))
+      const priorityReplies=this._priorityTiebaReplies(ready)
+      const directedReplies=new Set(ready.filter(directedTiebaIncoming).map(task=>task.id))
+      ready.sort((a,b)=>Number(b.metadata.execution==='publication')-Number(a.metadata.execution==='publication')||Number(b.metadata.trigger==='manual')-Number(a.metadata.trigger==='manual')||Number(dueExploration.has(b.id))-Number(dueExploration.has(a.id))||Number(priorityReplies.has(b.id))-Number(priorityReplies.has(a.id))||Number(directedReplies.has(b.id))-Number(directedReplies.has(a.id))||Number(b.metadata.human)-Number(a.metadata.human)||a.created_at-b.created_at||a.id.localeCompare(b.id))
       let denied=null
       for(const first of ready){
         const publication=first.metadata.execution==='publication'
@@ -335,6 +395,11 @@ export class NativeActivity {
           try{linked=this._publication(first)}catch(error){this._finishInvalid(first,error.message);continue}
           if(linked.status==='confirmed'||isCompletedShareIntent(this.store,linked)){this._finishInvalid(first,'原稿已确认，无需重复发表','completed');continue}
           if(linked.status==='unknown'||['leased','submitting'].includes(linked.status)){this._finishInvalid(first,'原稿结果未知或由其他执行者处理，不重放','unknown');continue}
+          if(linked.kind==='tieba.reply'&&tiebaBarRepliesIgnored(this.store.getDocument('tieba')?.value.tieba,linked.target.bar)){
+            const reason='主人已永久忽略此吧来信，已跳过回复'
+            if(['draft','queued'].includes(linked.status))new NativeOutbox({store:this.store,now:this.now}).cancel(linked.id,{expected_digest:linked.request_digest,reason})
+            this._finishInvalid(first,reason,'cancelled');continue
+          }
           if(linked.status!=='queued'||!linked.approval_token){this._finishInvalid(first,'原稿需要明确授权','draft');continue}
         }
         const domain=this._batchDomain(first)
@@ -355,12 +420,14 @@ export class NativeActivity {
           task.metadata=metadata;task.status='leased';this._event(task,'leased')
         }
         if(!publication&&!monitoredIncoming(first)&&this.background_model?.({kind:first.kind,platform:first.platform,tasks})!==true){state.value.idle.last_activity_at=now;this._save(state)}
+        const standardOutput=valleyDecision(now,p).valley||first.metadata.trigger==='manual'||first.metadata.human?p.model?.max_output_tokens??1800:p.model?.peak_max_output_tokens??900
+        const maxOutput=!publication&&first.platform==='tieba'&&first.kind==='activity.incoming'?p.model?.tieba_incoming_max_output_tokens??standardOutput:standardOutput
         return {batch:{id:batch_id,batch_id,platform:first.platform,kind:first.kind,execution:first.metadata.execution,trigger:first.metadata.trigger,
           estimated_tokens,reservation_id:reservation?.reservation_id??'',lease_until,tasks:tasks.map(task=>this._get(task.id)),
-          model:{reasoning_effort:p.model?.reasoning_effort??'low',max_output_tokens:valleyDecision(now,p).valley||first.metadata.trigger==='manual'||first.metadata.human?p.model?.max_output_tokens??1800:p.model?.peak_max_output_tokens??900,max_steps:p.budget?.max_steps??8}},lease_token}
+          model:{max_output_tokens:maxOutput,max_steps:p.budget?.max_steps??8}},lease_token}
       }
       if(denied)return {reason:denied.reason,next_eligible_at:denied.not_before??(denied.reason==='budget'?shanghaiTime(this._now()).midnight+86400000:null)}
-      const gates=queued.map(task=>this._gate(task,state,p)).filter(row=>row.reason!=='ready')
+      const gates=queued.map(task=>this._gate(task,state,p,gateOptions)).filter(row=>row.reason!=='ready')
       return {reason:gates[0]?.reason??'empty',next_eligible_at:gates.map(row=>row.next_eligible_at).filter(Number.isSafeInteger).sort((a,b)=>a-b)[0]??null}
     })
   }
@@ -475,9 +542,10 @@ export class NativeActivity {
   }
   status(){
     const now=this._now(),p=this._policy(),state=this._state(),budget=this.budget.status(),tasks=this._list()
+    const gateOptions={model_gate_cache:new Map()}
     const events=tasks.map(task=>{
       let gate
-      if(task.status==='queued')gate=this._gate(task,state,p)
+      if(task.status==='queued')gate=this._gate(task,state,p,gateOptions)
       else if(task.status==='blocked')gate={reason:'platform_blocked',next_eligible_at:this._block(state,task.platform)?.until??null}
       else if(task.status==='draft')gate={reason:'approval_required',next_eligible_at:null}
       else gate={reason:task.status,next_eligible_at:null}

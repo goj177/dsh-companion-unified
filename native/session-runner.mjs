@@ -15,6 +15,7 @@ import {canonicalBar} from './tieba-atmosphere.mjs'
 import { isPlainObject,stringifyJson } from './contracts.mjs'
 import { valleyDecision } from '../policy.mjs'
 import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
+import {NATIVE_HOME_WORKSPACE_ID,NATIVE_HOME_WORKSPACE_TITLE} from './defaults.mjs'
 
 const fields=(value,keys)=>{if(!isPlainObject(value)||Object.keys(value).some(key=>!keys.includes(key)))throw new Error('原生SDK接线参数包含未知字段')}
 const text=(value,label,max=512)=>{if(typeof value!=='string'||!value||value.length>max||/[\0\r\n]/.test(value))throw new Error(label+'无效');return value}
@@ -32,7 +33,7 @@ async function loadSdk(){return hostSdk??=Promise.all([import('@deepseek-ai/dsh-
  * createUserMessage, agentDefaultModel.currentSelection, presets.mount and
  * sessions.flush(agent.session). No old cwd or transport-source fallback. */
 export function createNativeSessionController(ctx,options={}){
-  fields(options,['resources','sdk','setup','resolve_images','resolve_activity_images','session_names','scope_tools'])
+  fields(options,['resources','sdk','setup','resolve_images','resolve_activity_images','session_names','scope_tools','default_model'])
   if(typeof options.resources?.workspace!=='function')throw new Error('SDK会话必须使用显式原生workspace资源')
   if(options.setup!==undefined&&typeof options.setup!=='function')throw new Error('setup必须为可信宿主函数')
   if(options.resolve_images!==undefined&&typeof options.resolve_images!=='function')throw new Error('resolve_images必须为可信宿主函数')
@@ -43,19 +44,20 @@ export function createNativeSessionController(ctx,options={}){
   const agents=()=>{const found=service(ctx,'agents');if(!found?.create||!found?.resume||!found?.get)throw new Error('宿主AgentRegistry尚未就绪');return found}
   const workspace=async id=>{const cwd=await options.resources.workspace(text(id,'workspace_id'));if(typeof cwd!=='string'||!path.isAbsolute(cwd)||cwd!==path.resolve(cwd)||cwd.includes('\0'))throw new Error('workspace资源必须返回已校验的新物理绝对目录');return cwd}
   const inputOf=input=>{fields(input,['session_id','workspace_id','agent_preset_id','platform','conversation_id','purpose','retired','last_registered_at','interim_messages','goal','session_title']);text(input.session_id,'session_id',240);text(input.workspace_id,'workspace_id');if(input.session_title!==undefined)text(input.session_title,'session_title',240);return input}
-  const selected=()=>{try{return service(ctx,'agentDefaultModel')?.currentSelection()}catch{return undefined}}
+  const selected=()=>{try{return options.default_model?.()??service(ctx,'agentDefaultModel')?.currentSelection()}catch{return undefined}}
   async function compose(input,cwd,resume){
     const api=await sdk(),selection=selected(),presets=service(ctx,'agentPresets')
+    const matchesWorkspace=actual=>actual===cwd||resume&&input.workspace_id===NATIVE_HOME_WORKSPACE_ID&&options.resources.sameWorkspace?.(actual,cwd)===true
     let preset=input.agent_preset_id||undefined
     if(presets?.resolve)preset=(await presets.resolve(preset)).id
     if(resume){const persisted=service(ctx,'sessionPersistence');if(!persisted?.open)throw new Error('宿主原生Session持久服务尚未就绪');const handle=await persisted.open(input.session_id,'read');try{
-      if(handle.header?.cwd!==cwd)throw new Error('已存会话工作区不等于显式新资源；拒绝恢复旧cwd')
+      if(!matchesWorkspace(handle.header?.cwd))throw new Error('已存会话工作区不等于显式新资源；拒绝恢复旧cwd')
       preset=handle.header.agentPreset??preset
       if(typeof handle.read==='function'){const record=await handle.read();const selected=[...(record.events??[])].reverse().find(event=>event.type==='agent-preset/selected'&&typeof event.data?.agentPreset==='string');if(selected)preset=selected.data.agentPreset}
     }finally{await handle.close()}}
     const model=selection?{provider:selection.provider,model:selection.model,...(selection.reasoningEffort?{reasoningEffort:selection.reasoningEffort}:{})}:{}
     const setup=async(agentCtx,agent)=>{
-      if(agent.session.header.cwd!==cwd)throw new Error('SDK会话工作区与原生资源不一致')
+      if(!matchesWorkspace(agent.session.header.cwd))throw new Error('SDK会话工作区与原生资源不一致')
       if(presets?.mount)await presets.mount(agentCtx,preset)
       if(selection&&api.installModelSelection)api.installModelSelection(agentCtx,{current:selection,assembled:undefined})
       // These existing short-task guards already forbid skill execution. Keep
@@ -66,17 +68,22 @@ export function createNativeSessionController(ctx,options={}){
     }
     const handle=resume?await agents().resume({resumeSessionId:input.session_id,agentOptions:model,setup}):await agents().create({sessionId:input.session_id,meta:{cwd,...(preset?{agentPreset:preset}:{})},agentOptions:model,setup})
     try{
-      if(handle?.agent?.session?.id!==input.session_id||handle.agent.session.header.cwd!==cwd)throw new Error('SDK返回不同会话或旧工作区，未提交输入')
+      if(handle?.agent?.session?.id!==input.session_id||!matchesWorkspace(handle.agent.session.header.cwd))throw new Error('SDK返回不同会话或旧工作区，未提交输入')
       await options.session_names?.update(handle.agent.session,input)
       const registry=service(ctx,'workspaceRegistry')
-      if(registry?.resolveByPath){const entry=await registry.resolveByPath(cwd)??await registry.create(cwd);await entry.attachSession(input.session_id)}
+      if(registry?.resolveByPath){
+        const title=input.workspace_id===NATIVE_HOME_WORKSPACE_ID?NATIVE_HOME_WORKSPACE_TITLE:undefined
+        const entry=await registry.resolveByPath(cwd)??await registry.create(cwd,title)
+        if(title&&entry.title!==title&&typeof entry.setTitle==='function')await entry.setTitle(title)
+        await entry.attachSession(input.session_id)
+      }
       if(!resume)await handle.agent.whenIdle()
     }catch(error){await handle?.dispose?.();throw error}
     handles.set(input.session_id,handle);metadata.set(input.session_id,{...input,cwd});return {session_id:input.session_id}
   }
   async function admit(input,resume=false){
     inputOf(input);const cwd=await workspace(input.workspace_id),known=handles.get(input.session_id)
-    if(known){const prior=metadata.get(input.session_id);if(known.agent.session.header.cwd!==cwd||prior.platform!==input.platform||prior.conversation_id!==input.conversation_id)throw new Error('同一SDK会话不能跨工作区、平台或会话复用');return {session_id:input.session_id}}
+    if(known){const prior=metadata.get(input.session_id);if(prior.cwd!==cwd||prior.platform!==input.platform||prior.conversation_id!==input.conversation_id)throw new Error('同一SDK会话不能跨工作区、平台或会话复用');return {session_id:input.session_id}}
     if(pending.has(input.session_id)){const prior=pending.get(input.session_id);if(prior.cwd!==cwd||prior.input.platform!==input.platform||prior.input.conversation_id!==input.conversation_id)throw new Error('SDK会话正在绑定另一个原生上下文');return prior.promise}
     const promise=compose(input,cwd,resume);pending.set(input.session_id,{cwd,input,promise});try{return await promise}finally{pending.delete(input.session_id)}
   }
@@ -144,7 +151,7 @@ export function createNativeSessionController(ctx,options={}){
       const content=await activityImages(input,source,await qqImages(input,handle,source,original))
       if(handles.get(input.session_id)!==handle||agents().get(input.session_id)!==handle.agent)throw new Error('SDK图片准备期间会话Agent已变化，未投递旧输入')
       const api=await sdk(),message=api.createUserMessage({content,source})
-      options.scope_tools?.(handle.agent,true)
+      options.scope_tools?.(handle.agent,true,content)
       requests.add(key)
       try{if(mode==='steer')handle.agent.steer(message);else handle.agent.followup(message)}catch{throw new Error('SDK输入投递未确认；保持原request_id，不自动再次触发')}
       if(requests.size>4096)requests.delete(requests.values().next().value)
@@ -200,7 +207,6 @@ export class NativeSessionRunner {
     if(!(options.store instanceof NativeStore)||!options.controller?.create||!options.controller?.prompt||!options.controller?.get)throw new Error('原生活动runner需要NativeStore与真实SDK controller')
     if(!isPlainObject(options.workspace_ids))throw new Error('活动工作区ID必须明确绑定')
     this.store=options.store;this.controller=options.controller;this.workspace_ids=options.workspace_ids;this.qq=options.qq;this.money=options.money_budget;if(this.money&&this.money.store!==this.store)throw new Error('费用预算必须同库');this.context_resolver=options.context_resolver;this.memory_sources=options.memory_sources;this.maintenance_binding=options.maintenance_binding;this.tool_outcome=options.tool_outcome;this.now=options.now??this.store.now;this.pending=new Map();this.finished=new Map();this.request_ids=new WeakMap();this.counter=0
-    this.auxiliary_requests=new WeakMap()
     this.run=this.run.bind(this)
   }
   context(session_id){const task=this.pending.get(session_id);return task?{...task.context}:null}
@@ -219,14 +225,15 @@ export class NativeSessionRunner {
     try{
       if(batch.platform==='qq'&&!subtype){
         const target=batch.tasks[0].target,config=this.store.getDocument('activity')?.value.qq??{}
-        conversation_id=target.conversation_id??(target.target==='group'?config.group_conversations?.[0]:config.owner_conversation)
+        conversation_id=target.conversation_id??(target.target==='contact'?'':target.target==='group'?config.group_conversations?.[0]:config.owner_conversation)
         if(!conversation_id||!this.qq?.prepareAutonomous)return {status:'not_started',reason:'QQ短会话或授权目标尚未就绪'}
-        prepared=await this.qq.prepareAutonomous(conversation_id);session_id=prepared.session_id
+        prepared=await this.qq.prepareAutonomous(conversation_id,{proactive_contact:target.target==='contact'});session_id=prepared.session_id
       }else{
         session_id='companion-native-'+batch.platform+'-'+randomUUID();conversation_id=batch.tasks[0].target.conversation_id??''
-        await this.controller.create({session_id,workspace_id,platform,conversation_id,session_title:activitySessionName(batch,this.now()),purpose:memory_only?'memory-maintenance':subtype?'internal-maintenance':'autonomous'})
+        const executionWorkspace=this.workspace_ids.main??workspace_id
+        await this.controller.create({session_id,workspace_id:executionWorkspace,platform,conversation_id,session_title:activitySessionName(batch,this.now()),purpose:memory_only?'memory-maintenance':subtype?'internal-maintenance':'autonomous'})
       }
-    }catch{return {status:'not_started',reason:'新SDK会话创建失败；未调用模型'}}
+    }catch(error){return error?.code==='qq_proactive_contact_denied'?{status:'not_started',retry:false,reason:error.message}:{status:'not_started',reason:'新SDK会话创建失败；未调用模型'}}
     const request_id='native-task:'+batch.id,base={session_id,workspace_id,platform,conversation_id,actor_uid:'',owner_authorized:false,include_secret:false,memory_only,query:batch.tasks.map(task=>task.target.query??task.target.topic??task.body??'').join(' ').slice(0,1200)}
     let trusted,sources='',context
     try{trusted=this.context_resolver?await this.context_resolver(batch,{...base}):{};context={...base,...trusted,session_id,workspace_id,platform,memory_only,...(subtype==='people'?{owner_authorized:false,read_memory:false,write_memory:false}:{})}
@@ -275,9 +282,9 @@ export class NativeSessionRunner {
       const row=this.store.db.prepare('SELECT kind,target_json,request_digest,metadata_json FROM actions WHERE id=?').get(value.action.id),meta=row?JSON.parse(row.metadata_json):{},target=row?JSON.parse(row.target_json):{}
       if(!row||row.kind!=='tieba.reply'||row.request_digest!==value.action.request_digest||meta.prepared_in?.round_id!==task.batch.id||meta.prepared_in?.task_id!==task.batch.id)return
       for(const original of task.batch.tasks)if(['thread_id','post_id','sub_reply_id'].every(key=>(target[key]??'')===(original.target[key]??''))&&(!target.reply_uid||target.reply_uid===original.target.actor_uid))task.incoming_resolved.add(original.id)
-    }else if(call.name==='companion_participation'&&['skip','pause'].includes(args.action)&&value.ok===true&&value.journal_id){
+    }else if(call.name==='companion_participation'&&(['skip','pause'].includes(args.action)||args.action==='reply'&&['other','general','unclear'].includes(args.addressee)&&value.action==='skip')&&value.ok===true&&value.journal_id){
       const event=this.store.db.prepare("SELECT metadata_json FROM journal_events WHERE id=? AND source_type='native_social_participation'").get(value.journal_id),meta=event?JSON.parse(event.metadata_json):{}
-      if(meta.task_id!==task.batch.id||meta.session_id!==task.session_id||meta.action!==args.action)return
+      if(meta.task_id!==task.batch.id||meta.session_id!==task.session_id||meta.action!==(args.action==='reply'?'skip':args.action))return
       for(const original of task.batch.tasks)if(original.id===meta.incoming_task_id&&original.source_evidence_id===meta.source_evidence_id)task.incoming_resolved.add(original.id)
     }
   }
@@ -315,57 +322,7 @@ export class NativeSessionRunner {
     if(!action)return false
     task.study_closing=true;return true
   }
-  auxiliaryStream(session_id,request,next){
-    const self=this
-    return (async function*(){
-      const task=self.pending.get(session_id)
-      const bound=()=>{
-        if(!task||self.pending.get(session_id)!==task||task.done||self.controller.get(session_id)?.session!==task.session||!['tieba','bilibili'].includes(task.batch.platform)||!['activity.incoming','activity.explore'].includes(task.batch.kind))throw Object.assign(new Error('图片描述未绑定当前真实公开平台任务'),{code:'NATIVE_IMAGE_UNBOUND'})
-        task.controls.signal?.throwIfAborted();request.signal?.throwIfAborted();task.controls.assert_active?.()
-        if(Number.isSafeInteger(task.controls.deadline_at)&&self.now()>=task.controls.deadline_at)throw new Error('图片描述所属任务已超时')
-      }
-      if(!isPlainObject(request)||request.sessionId!==session_id||typeof next!=='function'||!['deepseek-account','deepseek'].includes(request.provider)||request.model!=='deepseek-flash'||!Number.isSafeInteger(request.maxTokens)||request.maxTokens<1||request.maxTokens>512||!Array.isArray(request.tools)||request.tools.length)throw Object.assign(new Error('图片描述请求超出已授权辅助模型范围'),{code:'NATIVE_IMAGE_UNBOUND'})
-      bound()
-      const policy=effectiveActivityPolicy({store:self.store,now:self.now}),heavy=task.batch.tasks.some(item=>item.metadata?.heavy!==false)
-      if(policy.enabled!==true||heavy&&task.batch.trigger!=='manual'&&!valleyDecision(time(self.now()),policy).valley||task.total_tokens+2048>(policy.budget?.max_task_tokens??30000)||(task.auxiliary_calls??0)>=2)throw new Error('本轮图片描述的预算或调用次数不足')
-      const key='auxiliary:'+ ++self.counter,attempt={key,turn:task.turn,step:task.step,total:0,known:false,completed:false},entry={task,attempt,bound,started:false}
-      task.attempts.set(key,attempt);self.auxiliary_requests.set(request,entry)
-      try{
-        for await(const chunk of next()){
-          bound()
-          if(!entry.started)throw Object.assign(new Error('图片描述未经过现有模型预算流，停止本轮'),{code:'NATIVE_IMAGE_UNBOUND'})
-          yield chunk
-        }
-        if(!entry.started)throw Object.assign(new Error('图片描述未进入已核验的模型预算流'),{code:'NATIVE_IMAGE_UNBOUND'})
-        attempt.completed=true
-        if(!attempt.known)throw Object.assign(new Error('图片描述用量未确认，停止本轮且不自动重试'),{code:'NATIVE_IMAGE_USAGE_UNKNOWN'})
-        self._accountFinalUsage(task)
-      }catch(error){
-        if(!entry.started)task.attempts.delete(key)
-        else if(!attempt.known){
-          const failure=Object.assign(new Error('图片描述已开始但用量未确认，停止本轮且保留占额'),{code:'NATIVE_IMAGE_USAGE_UNKNOWN'})
-          void self.controller.stop?.({session_id});self._complete(task,{status:'unknown',reason:failure.message});throw failure
-        }
-        else attempt.completed=true
-        throw error
-      }finally{self.auxiliary_requests.delete(request)}
-    })()
-  }
-  _auxiliaryProviderStream(entry,request,next){
-    const self=this
-    return (async function*(){
-      entry.bound()
-      if(entry.started)throw new Error('同一图片描述请求不能重复进入模型')
-      const {task,attempt}=entry
-      if(!task.model_started){task.controls.mark_started();task.model_started=true}
-      entry.started=true;task.auxiliary_calls=(task.auxiliary_calls??0)+1
-      for await(const chunk of next()){entry.bound();if(chunk?.type==='usage')self._usage(task,attempt,chunk.usage);yield chunk}
-      attempt.completed=true;self._accountFinalUsage(task)
-    })()
-  }
   stream(options,next,{is_loop_request}={}){
-    const auxiliary=this.auxiliary_requests.get(options)
-    if(auxiliary)return this._auxiliaryProviderStream(auxiliary,options,next)
     const task=this.pending.get(options?.sessionId)
     if(!task||!is_loop_request)return next()
     if(!task.input_bound||!task.user_committed||task.done)return (async function*(){throw new Error('SDK模型流未绑定本任务已提交的真实输入；未调用provider')})()

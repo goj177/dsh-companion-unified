@@ -383,7 +383,9 @@ export class NativeMemory {
       if(items.length>=q.limit)break
       const prefix='['+entryLabel(row)+' '+row.id+'] ',room=q.max_chars-used-prefix.length-(lines.length?1:0)
       if(room<12)break
-      const offset=this._matchOffset(row.content,q.terms),chunk=page(row.content,{offset,max_chars:Math.min(room,520)})
+      const slots=Math.min(q.limit,rows.length)-items.length
+      const share=q.limit>8?Math.max(12,Math.floor((room+prefix.length+1)/slots)-prefix.length-1):520
+      const offset=this._matchOffset(row.content,q.terms),chunk=page(row.content,{offset,max_chars:Math.min(room,share,520)})
       const entry=this._describeEntry(row,context);delete entry.content;delete entry.object
       items.push({...entry,...chunk});const line=prefix+chunk.text;lines.push(line);used+=line.length+(lines.length>1?1:0)
     }

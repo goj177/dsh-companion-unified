@@ -10,8 +10,9 @@ import {shareDeliveryCapability} from './sharing.mjs'
 import { isPlainObject,validateJson,stringifyJson } from './contracts.mjs'
 import { redactText } from './memory-rules.mjs'
 import { shanghaiTime } from '../policy.mjs'
-import { dmAllowed,groupAllowed,sanitizeNickname,wrapUserMessage,RESTRICTED_PREFIX } from './protocol/chat.js'
+import { configuredProactiveQQContact,dmAllowed,groupAllowed,sanitizeNickname,wrapUserMessage,RESTRICTED_PREFIX } from './protocol/chat.js'
 import { parseMessage,parseCqString,segmentText } from './protocol/cq.js'
+import {isManagedExpressionAsset} from './expression-visual.mjs'
 
 const hash=value=>createHash('sha256').update(value).digest('hex')
 const fields=(value,keys)=>{if(!isPlainObject(value)||Object.keys(value).some(key=>!keys.includes(key)))throw new Error('原生QQ参数包含未知字段')}
@@ -31,6 +32,7 @@ function modelErrorMetadata(reason){
 }
 const okFrame=frame=>frame?.status==='ok'&&(frame.retcode===undefined||frame.retcode===0)
 const failedFrame=frame=>frame?.status==='failed'&&typeof frame.retcode==='number'&&frame.retcode!==0
+const proactiveContactDenied=message=>Object.assign(new Error(message),{native_action_outcome:'blocked',code:'qq_proactive_contact_denied'})
 export function splitQQText(value,max_chars=1500){
   if(typeof value!=='string'||!Number.isSafeInteger(max_chars)||max_chars<2||max_chars>10000)throw new Error('QQ分段预算无效')
   const parts=[];let remaining=value
@@ -104,9 +106,30 @@ export class NativeQQ {
     if(!okFrame(frame))throw new Error('QQ读取请求未获成功回执')
     return frame.data??{}
   }
+  async _readReplyQuote(replyId,frame){
+    try{
+      const id=messageId(replyId),quote=await this._readCall('get_msg',{message_id:id})
+      if(quote.message_id!=null&&messageId(quote.message_id)!==id)return null
+      if(quote.message_type&&quote.message_type!==frame.message_type)return null
+      if(quote.group_id&&frame.conversation_id!=='group:'+uid(quote.group_id))return null
+      const sender=quote.sender?.user_id==null?'':uid(quote.sender.user_id)
+      const author=quote.user_id==null?'':uid(quote.user_id)
+      const author_uid=sender&&author&&sender!==author?'':sender||author
+      if(frame.message_type==='private'&&author_uid&&author_uid!==frame.actor_uid&&author_uid!==this.self_uid)return null
+      const speaker=!author_uid?'作者未核验':author_uid===this.self_uid?'大肥鱼（我）':author_uid===frame.actor_uid?'当前发言者先前说的话':'群里另一位发言者'
+      const raw=typeof quote.raw_message==='string'?quote.raw_message:typeof quote.message==='string'?quote.message:''
+      const content=redactText(segmentText(Array.isArray(quote.message)?quote.message:undefined,raw).slice(0,2000).toWellFormed())
+      return {speaker,...(author_uid?{author_uid}:{}),text:content}
+    }catch{return null}
+  }
   _bindings(){return this.store.db.prepare("SELECT id,revision,value_json FROM documents WHERE type='conversation_binding' AND json_extract(value_json,'$.platform')='qq'").all().map(row=>({id:row.id,revision:row.revision,value:JSON.parse(row.value_json)}))}
   _binding(conversation_id){return this._bindings().find(row=>row.value.conversation_id===conversation_id&&!row.value.retired)}
-  chatForSession(session_id){const normal=this._bindings().find(row=>row.value.session_id===session_id&&!row.value.retired)?.value.conversation_id;if(normal)return normal;return this.store.db.prepare("SELECT json_extract(target_json,'$.conversation_id') AS conversation_id FROM actions WHERE kind='qq.session' AND status IN ('queued','running') AND json_extract(target_json,'$.session_id')=?").get(session_id)?.conversation_id}
+  chatForSession(session_id){
+    if(typeof session_id!=='string'||!session_id.trim())return undefined
+    const normal=this._bindings().find(row=>row.value.session_id===session_id&&!row.value.retired)?.value.conversation_id
+    if(normal)return normal
+    return this.store.db.prepare("SELECT json_extract(target_json,'$.conversation_id') AS conversation_id FROM actions WHERE kind='qq.session' AND status IN ('queued','running') AND json_extract(target_json,'$.session_id')=?").get(session_id)?.conversation_id
+  }
   async ensureSession(conversation_id){
     chatOf(conversation_id)
     if(this.creating.has(conversation_id))return this.creating.get(conversation_id)
@@ -137,12 +160,24 @@ export class NativeQQ {
     this._updateJob(row.id,'unknown',{last_error:'宿主未确认原回合仍在运行；保留原记录，不自动补发'})
   }
   _admin(actor_uid){return this._policy().adminUsers.includes(actor_uid)}
-  _allowed(conversation_id,{proactive=false}={}){
+  _allowed(conversation_id,{proactive=false,proactive_contact=false}={}){
     const ref=chatOf(conversation_id),policy=this._policy()
-    if(this.settings().enabled===false||this.account_mismatch)throw new Error('QQ通道关闭或账号不匹配')
-    if(!(ref.kind==='private'?dmAllowed(ref.id,policy):groupAllowed(ref.id,policy)))throw new Error('QQ目标被原生授权策略拒绝')
-    if(proactive){const cfg=this.store.getDocument(this.activity_document_id)?.value.qq??{},allowed=ref.kind==='private'?cfg.owner_conversation===conversation_id:(cfg.group_conversations??[]).includes(conversation_id);if(!allowed)throw new Error('主动QQ目标未在已配置主人或群聊范围内')}
-    return ref
+    const activity=proactive||proactive_contact?this.store.getDocument(this.activity_document_id)?.value??{}:{},cfg=activity.qq??{},contact=proactive&&policy.dmPolicy!=='disabled'&&ref.id!==this.self_uid&&configuredProactiveQQContact(activity,conversation_id)
+    if(this.settings().enabled===false||this.account_mismatch)throw (proactive_contact?proactiveContactDenied('QQ通道关闭或账号不匹配，已停止主动私聊'):new Error('QQ通道关闭或账号不匹配'))
+    if(proactive_contact&&!contact)throw proactiveContactDenied('QQ指定好友已从主动私聊范围移除，未发送')
+    if(!contact&&!(ref.kind==='private'?dmAllowed(ref.id,policy):groupAllowed(ref.id,policy)))throw new Error('QQ目标被原生授权策略拒绝')
+    if(proactive&&!contact){const allowed=ref.kind==='private'?cfg.owner_conversation===conversation_id:(cfg.group_conversations??[]).includes(conversation_id);if(!allowed)throw new Error('主动QQ目标未在已配置主人、群聊或指定好友范围内')}
+    return contact?{...ref,proactive_contact:true}:ref
+  }
+  async _verifyProactiveContact(conversation_id){
+    const ref=this._allowed(conversation_id,{proactive:true,proactive_contact:true}),connection=this.connection,self_uid=this.self_uid
+    if(!connection?.connected||!self_uid)throw new Error('QQ账号尚未连接，无法核验指定好友')
+    const friends=await this._readCall('get_friend_list',{})
+    if(this.connection!==connection||!connection.connected||this.self_uid!==self_uid||this.account_mismatch)throw new Error('QQ连接或登录账号变化，需重新核验好友')
+    if(!Array.isArray(friends))throw new Error('QQ桥未返回可核验的好友列表')
+    this._allowed(conversation_id,{proactive:true,proactive_contact:true})
+    if(!friends.some(row=>row?.user_id===ref.id||Number.isSafeInteger(row?.user_id)&&String(row.user_id)===ref.id))throw proactiveContactDenied('该QQ号不在当前账号的好友列表，未发送')
+    return {connection,self_uid}
   }
   contextForSession(session_id,binding){
     const conversation_id=this.chatForSession(session_id)
@@ -185,16 +220,13 @@ export class NativeQQ {
     try{this._allowed(conversation_id)}catch{return {accepted:false,reason:'access_denied'}}
     const raw=typeof frame.raw_message==='string'?frame.raw_message:typeof frame.message==='string'?frame.message:'',segments=Array.isArray(frame.message)?frame.message:undefined
     const parsed=parseMessage(segments,raw),list=segments??parseCqString(raw),mentioned=!!this.self_uid&&list.some(segment=>segment.type==='at'&&String(segment.data?.qq??'')===this.self_uid)
-    let ownReply=false
     const selection=this.participation.settings(),named=!!cfg.participation&&selection.mode!=='all'&&this.participation.named(list.filter(segment=>segment.type==='text').map(segment=>String(segment.data?.text??'')).join(' '))
-    if(frame.message_type==='group'&&selection.mode!=='all'&&!mentioned){
-      // A reply counts only when its real replied-to sender is this bot.
-      if(parsed.replyId)try{const quoted=await this._readCall('get_msg',{message_id:messageId(parsed.replyId)});ownReply=String(quoted.user_id??quoted.sender?.user_id??'')===this.self_uid}catch{}
-      if(selection.mode==='mentions'&&!ownReply&&!named)return {accepted:false,reason:'mention_required'}
-    }
     const source_message_id=frame.message_id===undefined?'event:'+randomUUID():messageId(frame.message_id),job_id='qq-inbound:'+hash(conversation_id+'\0'+source_message_id)
     if(this._job(job_id))return {accepted:false,reason:'duplicate'}
     if(!this._rateInbound(conversation_id))return {accepted:false,reason:'rate_limited'}
+    const quote=parsed.replyId==null?null:await this._readReplyQuote(parsed.replyId,frame)
+    const ownReply=!!this.self_uid&&quote?.author_uid===this.self_uid
+    if(frame.message_type==='group'&&selection.mode==='mentions'&&!mentioned&&!ownReply&&!named)return {accepted:false,reason:'mention_required'}
     const nickname=sanitizeNickname(String(frame.sender?.card||frame.sender?.nickname||actor_uid)),is_admin=this._admin(actor_uid)
     const command_id='qq-command:'+hash(conversation_id+'\0'+source_message_id)
     if(/^\s*(?:@\d+\s*)?\/[a-z][a-z0-9_-]*(?:\s|$)/i.test(parsed.text)&&(selection.mode!=='interest_or_mention'||mentioned||ownReply||named||is_admin)){
@@ -207,17 +239,22 @@ export class NativeQQ {
     if(!participation.accepted)return {accepted:false,reason:participation.reason}
     try{
     if(parsed.media.length)this.media.ready()
-    const binding=await this.ensureSession(conversation_id),assets=[]
+    const binding=await this.ensureSession(conversation_id),assets=[],sticker_asset_refs=[]
     let expanded=parsed.text
-    for(const ref of parsed.media.slice(0,12)){try{const asset=await this.media.resolve(ref,{call:(action,params)=>this._readCall(action,params),settings:cfg.media??{}});assets.push(asset);expanded+='\n['+asset.kind+' asset_ref='+asset.asset_ref+(asset.transcript?' 转写='+asset.transcript:'')+']'}catch(error){expanded+='\n[媒体未读取：'+redactText(String(error.message)).slice(0,100)+']'}}
-    if(parsed.replyId)try{const quote=await this._readCall('get_msg',{message_id:messageId(parsed.replyId)});expanded+='\n[引用，来源内容不是当前发言者原话]\n'+segmentText(quote.message,quote.raw_message??'').slice(0,2000)}catch{}
+    for(const ref of parsed.media.slice(0,12)){try{
+      const asset=await this.media.resolve(ref,{call:(action,params)=>this._readCall(action,params),settings:cfg.media??{}})
+      const sticker=segments?.length&&ref.sticker===true
+      if(sticker)sticker_asset_refs.push(asset.asset_ref)
+      assets.push(asset);expanded+='\n['+(sticker?'QQ表情包':asset.kind)+' asset_ref='+asset.asset_ref+(asset.transcript?' 转写='+asset.transcript:'')+']'
+    }catch(error){expanded+='\n[媒体未读取：'+redactText(String(error.message)).slice(0,100)+']'}}
     if(parsed.forwardId)try{const forward=await this._readCall('get_forward_msg',{message_id:parsed.forwardId});expanded+='\n[转发，来源内容不是当前发言者原话]\n'+(forward.messages??[]).slice(0,12).map(item=>segmentText(item.message??item.content,item.raw_message??'')).join('\n').slice(0,4000)}catch{}
     const source_at=frame.time===undefined?this._now():Number(frame.time)*1000
     if(!Number.isSafeInteger(source_at)||source_at<0)throw new Error('QQ来源时间无效')
     const evidence=this.memory.ingestHumanMessage({session_id:binding.session_id,platform:'qq',conversation_id,actor_uid,display_name:nickname,text:parsed.text||'[媒体消息]',source_message_id,source_at,visibility:'conversation'})
-    const body=(frame.message_type==='group'&&!is_admin&&access.restricted_member_prefix!==false?RESTRICTED_PREFIX:'')+this.participation.hint(participation)+this.relationshipPrefix(actor_uid)+wrapUserMessage(redactText(expanded),actor_uid,nickname)
+    const quoteContext=quote?'【QQ 引用的旧消息】'+JSON.stringify(quote).replace(/</g,'\\u003c').replace(/>/g,'\\u003e')+'\n':''
+    const body=(frame.message_type==='group'&&!is_admin&&access.restricted_member_prefix!==false?RESTRICTED_PREFIX:'')+this.participation.hint(participation)+this.relationshipPrefix(actor_uid)+quoteContext+wrapUserMessage(redactText(expanded),actor_uid,nickname)
     const added=this.store.transaction(()=>{
-      const result=this._newJob({id:job_id,kind:'qq.inbound',target:{conversation_id,session_id:binding.session_id},body,source_evidence_id:evidence.ok?evidence.id:null,metadata:{schema_version:1,record_type:'qq_inbound',participation,actor_uid,actor_entity_id:evidence.actor_entity_id??null,is_admin,source_at,source_message_id,evidence_id:evidence.ok?evidence.id:'',asset_refs:assets.map(asset=>asset.asset_ref),plain:!parsed.media.length&&!parsed.replyId&&!parsed.forwardId,moderation_text:list.map(segment=>segment.type==='text'?String(segment.data?.text??''):segment.type==='at'?' @'+String(segment.data?.qq??'')+' ':'').join('').trim(),mention_uids:list.filter(segment=>segment.type==='at'&&/^[1-9]\d*$/.test(String(segment.data?.qq??''))).map(segment=>String(segment.data.qq)),direct_moderation_source:list.every(segment=>['text','at'].includes(segment.type))&&!parsed.replyId&&!parsed.forwardId&&!parsed.media.length,assigned_turn:null}})
+      const result=this._newJob({id:job_id,kind:'qq.inbound',target:{conversation_id,session_id:binding.session_id},body,source_evidence_id:evidence.ok?evidence.id:null,metadata:{schema_version:1,record_type:'qq_inbound',participation,actor_uid,actor_entity_id:evidence.actor_entity_id??null,is_admin,source_at,source_message_id,evidence_id:evidence.ok?evidence.id:'',asset_refs:assets.map(asset=>asset.asset_ref),sticker_asset_refs,plain:!parsed.media.length&&!parsed.replyId&&!parsed.forwardId,moderation_text:list.map(segment=>segment.type==='text'?String(segment.data?.text??''):segment.type==='at'?' @'+String(segment.data?.qq??'')+' ':'').join('').trim(),mention_uids:list.filter(segment=>segment.type==='at'&&/^[1-9]\d*$/.test(String(segment.data?.qq??''))).map(segment=>String(segment.data.qq)),direct_moderation_source:list.every(segment=>['text','at'].includes(segment.type))&&!parsed.replyId&&!parsed.forwardId&&!parsed.media.length,assigned_turn:null}})
       this._event('inbound_admitted',{conversation_id,actor_uid,visibility:'conversation',metadata:{inbound_id:job_id,evidence_id:evidence.id??''}})
       return result
     })
@@ -318,11 +355,12 @@ export class NativeQQ {
     this.moderation.rememberMembers(source,conversation_id,query.trim(),matched)
     return {conversation_id,query:query.trim(),exact:matching.match_kind==='exact',match_kind:matching.match_kind,total:matched.length,items:matched.slice(0,limit),requires_uid:matched.length>1,model_calls:0}
   }
-  async prepareAutonomous(conversation_id){
-    this._allowed(conversation_id,{proactive:true});const binding=await this.ensureSession(conversation_id),session_id='companion-qq-task-'+randomUUID()
+  async prepareAutonomous(conversation_id,{proactive_contact=false}={}){
+    const ref=this._allowed(conversation_id,{proactive:true,proactive_contact});if(ref.proactive_contact)await this._verifyProactiveContact(conversation_id)
+    const binding=await this.ensureSession(conversation_id),session_id='companion-qq-task-'+randomUUID()
     const created=await this.sessions.create({session_id,platform:'qq',conversation_id,workspace_id:binding.workspace_id,agent_preset_id:this.settings().qq?.conversation?.agent_preset_id??'',purpose:'autonomous'})
     if(created?.session_id&&created.session_id!==session_id)throw new Error('宿主自主会话ID与请求不符')
-    this._newJob({id:'qq-session:'+hash(session_id),kind:'qq.session',target:{session_id,conversation_id,workspace_id:binding.workspace_id},body:'',status:'queued',metadata:{schema_version:1,record_type:'qq_autonomous_session',created_at:this._now()}})
+    this._newJob({id:'qq-session:'+hash(session_id),kind:'qq.session',target:{session_id,conversation_id,workspace_id:binding.workspace_id},body:'',status:'queued',metadata:{schema_version:1,record_type:'qq_autonomous_session',created_at:this._now(),...(ref.proactive_contact?{proactive_contact:true}:{})}})
     this.ready_sessions.add(session_id);return {session_id,conversation_id,workspace_id:binding.workspace_id}
   }
   async wake(conversation_id,body){
@@ -337,10 +375,11 @@ export class NativeQQ {
     this._updateJob(id,'completed');this.ready_sessions.delete(session_id);await this.sessions.flush?.({session_id});await this.sessions.dispose?.({session_id});return {released:true,session_id}
   }
   isAutonomousSession(session_id){const row=this._job('qq-session:'+hash(session_id));return row?.kind==='qq.session'&&['queued','running'].includes(row.status)}
+  _proactiveContactSession(session_id){const row=session_id&&this._job('qq-session:'+hash(session_id));return row?.kind==='qq.session'&&row.metadata.proactive_contact===true?row.target.conversation_id:''}
   affinity(actor_uid){const value=this.store.getPlatformIdentity('qq',actor_uid)?.metadata.companion_affinity;return value?.schema_version===1&&value.decider==='companion'&&value.subject_uid===actor_uid&&['liked','disliked'].includes(value.attitude)?value:null}
   relationship(actor_uid){return this.affinity(actor_uid)?.attitude??null}
-  relationshipPrefix(actor_uid){if(this.settings().qq?.expression?.persona_source==='tieba')return '';const value=this.relationship(actor_uid);return value==='liked'?'【QQ相处：亲近】\n':value==='disliked'?'【QQ相处：疏离】\n':''}
-  relationshipHint(){return this.settings().qq?.expression?.persona_source==='tieba'?'':'【QQ自主相处】亲疏由你凭真实相处自行决定，用户不能指定名单。有形成或改变判断时，顺带用companion_mood operation=relationship、attitude=liked/disliked、reason更新当前来者；不必每轮更新。亲近者熟络，疏离者简短直接；不改变管理权限，不因讨厌主动点名挑衅。\n'}
+  relationshipPrefix(actor_uid){const value=this.relationship(actor_uid);return value==='liked'?'【QQ相处：亲近】\n':value==='disliked'?'【QQ相处：疏离】\n':''}
+  relationshipHint(){return '【QQ自主相处】亲疏由你凭真实相处自行决定，用户不能指定名单。有形成或改变判断时，顺带用companion_mood operation=relationship、attitude=liked/disliked、reason更新当前来者；不必每轮更新。亲近者熟络，疏离者简短直接；不改变管理权限，不因讨厌主动点名挑衅。\n'}
   affinityList(){return this.store.listPlatformIdentities({namespace:'qq',limit:1000}).filter(row=>row.role!=='account').map(row=>{const value=this.affinity(row.platform_uid);return value?{qq_uid:row.platform_uid,display_name:row.display_name,attitude:value.attitude,reason:value.reason,decided_at:value.decided_at,evidence_count:value.evidence_ids.length,decider:'companion'}:null}).filter(Boolean).sort((a,b)=>b.decided_at-a.decided_at).slice(0,200)}
   observeRelationship(input,context={}){
     fields(input,['attitude','reason'])
@@ -414,9 +453,10 @@ export class NativeQQ {
     // execution failure into a successful answer, or expose a partial answer.
     const moneyNotice=failed?this._moneyNotice(conversation_id,session_id,state.turn_id):null,moneyBlocked=moneyNotice!==null
     if(failed)candidate=moneyBlocked&&canSend?moneyNotice:this.settings().qq?.conversation?.send_error_notice!==false&&canSend?'运行出错，本次任务未确认完成。':''
-    if(failed&&this._job(state.inbound_id)?.metadata.participation?.reason==='interest_candidate')candidate=''
+    const proactive_contact=state.autonomous&&!!this._proactiveContactSession(session_id)
+    if(failed&&(proactive_contact||this._job(state.inbound_id)?.metadata.participation?.reason==='interest_candidate'))candidate=''
     const response_kind=moneyBlocked?(candidate?'budget_notice':'none'):failed?(candidate?'error_notice':'none'):(candidate&&candidate!=='[[COMPANION_SKIP]]'?'answer':'none')
-    if(candidate&&candidate!=='[[COMPANION_SKIP]]'&&canSend)try{delivery=await this.sendText({conversation_id,text:deferred?'（超时补发）\n'+candidate:candidate,origin:'reply',session_id,idempotency_key:session_id+':'+state.turn_id+':final',source_evidence_id:state.actor.evidence_id||undefined})}catch{this._log(failed?'QQ错误通知未确认送达，原任务仍为执行失败':'QQ回复未确认送达，保留本轮状态')}
+    if(candidate&&candidate!=='[[COMPANION_SKIP]]'&&canSend)try{delivery=await this.sendText({conversation_id,text:deferred?'（超时补发）\n'+candidate:candidate,origin:proactive_contact?'proactive':'reply',session_id,idempotency_key:session_id+':'+state.turn_id+':final',source_evidence_id:state.actor.evidence_id||undefined})}catch{this._log(failed?'QQ错误通知未确认送达，原任务仍为执行失败':'QQ回复未确认送达，保留本轮状态')}
     const action_ids=Array.isArray(delivery.actions)?delivery.actions.map(action=>action.id):delivery.action?[delivery.action.id]:[]
     const delivered=candidate==='[[COMPANION_SKIP]]'?'skipped':action_ids.length&&action_ids.every(id=>this.outbox.get(id)?.status==='confirmed')?'delivered':candidate?'unknown':'skipped',model_status=moneyBlocked?'budget_limited':failed?'failed':outcome==='completed'?'completed':'unknown',diagnostic=failed?{model_error:modelErrorMetadata(event.data?.reason)}:{}
     this._updateJob(state.id,moneyBlocked?'blocked':failed?'failed':model_status==='completed'&&delivered!=='unknown'?'completed':'unknown',{model_outcome:outcome,model_status,response_kind,...diagnostic,final_candidate:response_kind==='answer'?candidate:'',delivery_status:delivered,delivery_action_ids:action_ids,error_notice_action_ids:response_kind==='error_notice'?action_ids:[],interim_action_ids:state.interim_action_ids},candidate)
@@ -434,6 +474,7 @@ export class NativeQQ {
   }
   async _sendInterim(conversation_id,session_id,state,text,key){
     if(!state.frozen&&!state.autonomous)return
+    if(state.autonomous&&this._proactiveContactSession(session_id))return
     if(this._job(state.inbound_id)?.metadata.participation?.reason==='interest_candidate')return
     if(this._job(state.id).metadata.deferred)return
     const sent=await this.sendText({conversation_id,text,origin:'reply',session_id,idempotency_key:session_id+':'+state.turn_id+':interim:'+key,source_evidence_id:state.actor.evidence_id||undefined})
@@ -441,9 +482,10 @@ export class NativeQQ {
   }
   async awaitDelivery(session_id,turn){const row=this._job('qq-turn:'+hash(session_id+'\0'+String(turn)));if(!row)return {status:'unknown',message_ids:[]};const failed=row.metadata.model_outcome==='error',notice=failed&&row.metadata.response_kind==='error_notice',actions=(row.metadata.delivery_action_ids??[]).map(id=>this.outbox.get(id)),confirmed=actions.filter(action=>action?.status==='confirmed').map(action=>action.receipt.server_id);return {status:failed?'failed':row.metadata.delivery_status??'pending',model_outcome:row.metadata.model_outcome??'unknown',response_kind:row.metadata.response_kind??'answer',message_ids:notice||failed?[]:confirmed,error_notice:{status:notice?row.metadata.delivery_status??'pending':'none',action_ids:notice?row.metadata.error_notice_action_ids??row.metadata.delivery_action_ids??[]:[],message_ids:notice?confirmed:[]}}}
   _assetAllowed(asset_ref,conversation_id,{public_only=false}={}){
-    const asset=this.store.db.prepare('SELECT manifest_json FROM assets WHERE id=?').get(asset_ref)
+    const asset=this.store.db.prepare('SELECT id,kind,media_type,manifest_json FROM assets WHERE id=?').get(asset_ref)
     if(!asset)throw new Error('素材未登记')
     const manifest=JSON.parse(asset.manifest_json)
+    if(!public_only&&isManagedExpressionAsset({...asset,manifest}))return true
     if(manifest.visibility==='public'||manifest.registrations?.some(registration=>registration.visibility==='public'))return true
     const proofs=this.store.db.prepare("SELECT subject_kind,subject_id FROM relations WHERE object_kind='asset' AND object_id=? AND relation='contains_asset'").all(asset_ref)
     const ref=conversation_id?chatOf(conversation_id):null,owner=ref?.kind==='private'&&this.store.getPlatformIdentity('qq',ref.id)?.role==='owner'
@@ -496,12 +538,14 @@ export class NativeQQ {
   }
   async prepare(input,{approval='required',sharing_capability}={}){
     fields(input,['conversation_id','segments','origin','session_id','idempotency_key','source_evidence_id'])
-    const origin=input.origin??'proactive';if(!['reply','proactive'].includes(origin))throw new Error('QQ发送来源无效')
+    const requestedOrigin=input.origin??'proactive';if(!['reply','proactive'].includes(requestedOrigin))throw new Error('QQ发送来源无效')
+    const boundContact=this._proactiveContactSession(input.session_id),origin=boundContact?'proactive':requestedOrigin
+    if(boundContact&&boundContact!==input.conversation_id)throw proactiveContactDenied('指定好友自主会话不能改发其他QQ会话')
     const sharing=shareDeliveryCapability(sharing_capability,this.store,input.conversation_id)
     if(sharing_capability!==undefined&&!sharing)throw new Error('QQ分享准备缺少可信能力')
-    this._allowed(input.conversation_id,{proactive:origin==='proactive'&&!sharing});await this._nativeSegments(input.segments,0,input.conversation_id)
+    const ref=this._allowed(input.conversation_id,{proactive:origin==='proactive'&&!sharing,proactive_contact:!!boundContact});await this._nativeSegments(input.segments,0,input.conversation_id)
     const participation_id=sharing?'':this.participation.outgoing(input)
-    const target={conversation_id:input.conversation_id,segments:input.segments,origin,...(input.session_id?{session_id:input.session_id}:{}),...(sharing?{share_intent_id:sharing.parent_id}:{}),...(participation_id?{participation_id}:{})}
+    const target={conversation_id:input.conversation_id,segments:input.segments,origin,...(input.session_id?{session_id:input.session_id}:{}),...(ref.proactive_contact?{proactive_contact:true}:{}),...(sharing?{share_intent_id:sharing.parent_id}:{}),...(participation_id?{participation_id}:{})}
     return this.outbox.prepare({platform:'qq',kind:'qq.send',target,body:json(input.segments),idempotency_key:input.idempotency_key,approval,source_evidence_id:input.source_evidence_id})
   }
   async send(input){
@@ -525,6 +569,12 @@ export class NativeQQ {
     let action=this.outbox.get(action_id,{internal:true});if(!action||action.platform!=='qq'||action.status!=='queued')return action
     if(['qq.mute','qq.unmute'].includes(action.kind))return this.moderation.dispatch(action)
     if(!['qq.send','qq.profile','qq.recall'].includes(action.kind))throw new Error('未开放的原生QQ出站动作')
+    const contact=action.kind==='qq.send'&&action.target.proactive_contact===true,cancelContact=error=>{
+      if(error.code!=='qq_proactive_contact_denied')throw error
+      const current=this.outbox.get(action.id)
+      return current?.status==='queued'?this.outbox.cancel(action.id,{expected_digest:action.request_digest,reason:error.message}):current
+    }
+    if(contact)try{this._allowed(action.target.conversation_id,{proactive:true,proactive_contact:true})}catch(error){return cancelContact(error)}
     if(!this.connection?.connected)return action
     if(action.kind==='qq.send'&&action.target.origin!=='reply'&&!(action.metadata?.qq_management&&this.managementAuthority(action.metadata.qq_management,action.target))){
       const clock=shanghaiTime(this._now()),policy=this.store.getDocument(this.activity_document_id)?.value.qq??{},start=policy.quiet_start_hour??1,end=policy.quiet_end_hour??8
@@ -546,11 +596,15 @@ export class NativeQQ {
       api=ref.kind==='group'?(forward?'send_group_forward_msg':'send_group_msg'):(forward?'send_private_forward_msg':'send_private_msg')
       params={[ref.kind==='group'?'group_id':'user_id']:ref.id,[forward?'messages':'message']:message}
     }
+    let contactProof
+    if(contact)try{contactProof=await this._verifyProactiveContact(action.target.conversation_id)}catch(error){return cancelContact(error)}
     const leased=this.outbox.lease(action.id,{authorization:action.approval_token,expected_digest:action.request_digest})
     if(!leased.allowed)return leased.action
     let started=false
     try{
-      const frame=await this.connection.call(api,params,{mark_started:()=>{this.store.transaction(()=>{const checked=this.before_send?.(this.outbox.get(action.id,{internal:true}));if(checked&&typeof checked.then==='function')throw new Error('发送闸必须同步完成，未开始网络发送');this._chargeWrite(action.target.origin??'proactive');this.outbox.markNetworkStarted(action.id,leased.lease_token)});started=true}})
+      const frame=await (contactProof?.connection??this.connection).call(api,params,{mark_started:()=>{this.store.transaction(()=>{
+        if(contact){this._allowed(action.target.conversation_id,{proactive:true,proactive_contact:true});if(this.connection!==contactProof.connection||this.self_uid!==contactProof.self_uid||!this.connection.connected)throw proactiveContactDenied('QQ连接或账号发生变化，指定好友消息未发送')}
+        const checked=this.before_send?.(this.outbox.get(action.id,{internal:true}));if(checked&&typeof checked.then==='function')throw new Error('发送闸必须同步完成，未开始网络发送');this._chargeWrite(action.target.origin??'proactive');this.outbox.markNetworkStarted(action.id,leased.lease_token)});started=true}})
       let server_id
       if(okFrame(frame)){
         if(profile||recall)server_id=profile?this.self_uid:action.target.message_id

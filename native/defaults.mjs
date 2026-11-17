@@ -2,21 +2,56 @@
 import {NativeStore,NATIVE_TABLES} from './store.mjs'
 import {validateDocument,validatePersona,isPlainObject} from './contracts.mjs'
 import {createHash} from 'node:crypto'
+import path from 'node:path'
 import {HORMONE_DEFAULTS} from './hormone.mjs'
 import {LEARNING_LOOP_DEFAULTS,freshLearningLoopState} from './learning-loop.mjs'
+import {sameNativeWorkspace} from './resources.mjs'
 
-export const NATIVE_WORKSPACE_IDS=Object.freeze({main:'workspace:main',qq:'workspace:qq',bilibili:'workspace:bilibili',tieba:'workspace:tieba'})
+export const NATIVE_HOME_WORKSPACE_ID='workspace:main'
+export const NATIVE_HOME_WORKSPACE_TITLE='欧鲸鲸的家'
+const LEGACY_QQ_WORKSPACE_ID='workspace:qq'
+const workspaceKey=id=>createHash('sha256').update(id).digest('hex')
+export const NATIVE_WORKSPACE_IDS=Object.freeze(Object.fromEntries(
+  ['main','qq','bilibili','tieba'].map(platform=>[platform,NATIVE_HOME_WORKSPACE_ID])
+))
+export const nativeHomeWorkspaceBinding=()=>({
+  id:'workspace-persona:'+workspaceKey(NATIVE_HOME_WORKSPACE_ID),
+  type:'workspace_persona_binding',schema_id:'companion.workspace_persona_binding',schema_version:1,
+  value:{workspace_id:NATIVE_HOME_WORKSPACE_ID,platform:'main',enabled:true},
+})
+
+export function migrateNativeHomeWorkspace(store){
+  return store.transaction(()=>{
+    const home=nativeHomeWorkspaceBinding()
+    if(!store.getDocument(home.id))store.putDocument({...home,expected_revision:0})
+    const qq=store.getDocument(store.getDocument('settings')?.value.platform_document_ids?.qq??'qq')
+    if(qq?.value.qq?.conversation?.workspace_id===LEGACY_QQ_WORKSPACE_ID){
+      const value=structuredClone(qq.value)
+      value.qq.conversation.workspace_id=NATIVE_HOME_WORKSPACE_ID
+      store.putDocument({id:qq.id,type:qq.type,value,expected_revision:qq.revision})
+    }
+    const workspaces=path.join(path.dirname(store.file),'workspaces')
+    const legacyPath=path.join(workspaces,workspaceKey(LEGACY_QQ_WORKSPACE_ID))
+    const homePath=path.join(workspaces,workspaceKey(NATIVE_HOME_WORKSPACE_ID))
+    if(!sameNativeWorkspace(legacyPath,homePath))return
+    for(const row of store.listDocuments({type:'conversation_binding',limit:1000})){
+      const binding=row.value
+      if(binding.platform!=='qq'||binding.retired||binding.workspace_id!==LEGACY_QQ_WORKSPACE_ID)continue
+      store.putDocument({id:row.id,type:row.type,expected_revision:row.revision,value:{...binding,workspace_id:NATIVE_HOME_WORKSPACE_ID}})
+    }
+  })
+}
 const profile=platform=>({id:'persona-'+platform,platform,follow_main:false,...(platform!=='main'?{main_profile_id:'persona-main'}:{}),name:'',self_ref:'',owner_address:'',body_md:'',
   traits:{},voice:{samples:[],quirks:[],particles:[],patterns:[]}})
 export function nativeDefaultDocuments({owner_entity_id}={}){
   const make=(id,type,value)=>({id,type,schema_id:'companion.'+type,schema_version:1,value})
   return [
-    make('settings','settings',{enabled:true,time_zone:'Asia/Shanghai',default_persona_id:'persona-main',activity_document_id:'activity',mood_document_id:'mood',speech_document_id:'speech',learning_document_id:'learning',platform_document_ids:{qq:'qq',tieba:'tieba',bilibili:'bilibili'},
+    make('settings','settings',{enabled:true,expression:{media_preference:5},time_zone:'Asia/Shanghai',default_persona_id:'persona-main',activity_document_id:'activity',mood_document_id:'mood',speech_document_id:'speech',learning_document_id:'learning',platform_document_ids:{qq:'qq',tieba:'tieba',bilibili:'bilibili'},
       familiarity:{sharing:'global',score_version:'native_contacts_v1',max_people:3,max_context_chars:180,public_summary_enabled:true},
       memory:{enabled:true,hit_limit:2,prompt_language:'zh',max_injection_chars:1800,consolidation_enabled:true,consolidation_batches_per_day:2,consolidation_source_limit:8,consolidation_max_chars:4800,backup_enabled:false,disabled_workspace_ids:[]}}),
     make('activity','activity',{enabled:false,time_zone:'Asia/Shanghai',holidays:[],budget:{daily_wake_limit:18,daily_token_limit:300000,reserve_tokens:10000,human_reserve_tokens:3000,max_task_tokens:30000,max_steps:8,urgent_human_allowed:true,money_budget_enabled:false,daily_cost_limit_fen:500},
       batching:{batch_ms:30000,human_batch_ms:0,max_batch:5,max_concurrent:3,max_per_platform:1,lease_ms:900000,task_timeout_ms:600000,min_valley_remaining_ms:120000},idle:{enabled:true,min_idle_ms:2700000,explore_every_ms:5400000,chat_every_ms:7200000,explore_platforms:['bilibili','tieba'],qq_targets:['owner','group']},
-      qq:{owner_conversation:'',group_conversations:[],profile_authorized:false,quiet_start_hour:1,quiet_end_hour:8},model:{reasoning_effort:'low',max_output_tokens:1800,peak_max_output_tokens:900},mood_judge:{min_interval_minutes:240,max_per_day:3,reserve_tokens:5000}}),
+      qq:{owner_conversation:'',group_conversations:[],private_conversations:[],profile_authorized:false,quiet_start_hour:1,quiet_end_hour:8},model:{max_output_tokens:1800,peak_max_output_tokens:900},mood_judge:{min_interval_minutes:240,max_per_day:3,reserve_tokens:5000}}),
     make('activity:state','activity_state',{idle:{last_activity_at:0,next_explore_at:0,next_chat_at:0,explore_cursor:0,chat_cursor:0},blocks:[]}),
     make('mood','mood',{enabled:true,shared:true,self_profile_id:'persona-main',...(owner_entity_id?{owner_entity_id}:{}),owner_address:'主人',policy:{baseline:70,floor:0,decay_half_hours:12,auto_judge:true,inject_mode:'event',inject_confidence:60,significant_delta:3,significant_dimension_delta:5,inject_per_day:6}}),
     make('hormone','hormone',structuredClone(HORMONE_DEFAULTS)),
@@ -37,7 +72,7 @@ export function nativeDefaultDocuments({owner_entity_id}={}){
     make('tieba','platform_settings',{platform:'tieba',enabled:false,account_entity_id:'account-tieba',tieba:{bars:[],keywords:[],permissions:{sign:false,follow:false,sign_all_followed:false,reply:false,answer_questions:true,sub_reply:false,new_thread:false,images:false,experimental_image_post:false,direct_message:false},inbox:{enabled:false,poll_interval_ms:180000,seed_on_start:true,allow_legacy_auth:false,daily_limit:30,gap_ms:60000},comment_inbox:{enabled:false,poll_interval_ms:60000,seed_on_start:true,max_pages:10},limits:{read_per_round:5,reply_per_round:1,reply_per_day:5,sub_reply_per_round:1,sub_reply_per_day:3,new_thread_per_day:1,image_per_day:10,reply_gap_ms:30000},requests:{gap_ms:1200,breaker_ms:1800000,dedupe_days:7},learning:{persona_evolution_enabled:false,hot_only:true,bar_style_enabled:false},diary:{enabled:true,private_enabled:true},expression:{tone_gate_enabled:true,mention_name:'',mention_uid:'',mention_every_reply:false}}}),
     ...['qq','bilibili','tieba'].map(platform=>make('platform-state-'+platform,'platform_state',{platform,paused_until:null,verification_required:false,verification_reason:''})),
     make('style-library-tieba','tieba_style_library',{platform:'tieba',historical:false,bars:[]}),make('bar-styles-tieba','tieba_bar_styles',{platform:'tieba',historical:false,bars:[]}),
-    ...Object.entries(NATIVE_WORKSPACE_IDS).map(([platform,workspace_id])=>make('workspace-persona:'+createHash('sha256').update(workspace_id).digest('hex'),'workspace_persona_binding',{workspace_id,platform,enabled:true})),
+    nativeHomeWorkspaceBinding(),
   ]
 }
 export function initNativeDefaults(store,{now=store?.now?.(),owner}={}){

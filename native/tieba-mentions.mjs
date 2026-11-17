@@ -2,8 +2,10 @@
  * tb1.bdstatic.com/tb/mobile/message_4365fd7.js and list_loader_6fd1483.js.
  * Feed previews never establish authorship; exact posts are reread before queueing. */
 import {TiebaError,tiebaId,decodeHtml,encodeSubRequest,parseSubPage} from './tieba-http.mjs'
-import {tiebaReplyPaused} from './tieba-target.mjs'
+import {tiebaBarRepliesIgnored,tiebaReplyPaused,tiebaThreadReplyPaused} from './tieba-target.mjs'
 import {packTiebaIncomingImageContext} from './tieba-vision.mjs'
+import {tiebaContextRecord} from './tieba-incoming.mjs'
+import {redactText} from './memory-rules.mjs'
 const DAY=86400000
 const content=(html,css)=>decodeHtml(new RegExp('<(?:span|div)\\b[^>]*class=["\'][^"\']*\\b'+css+'\\b[^"\']*["\'][^>]*>([\\s\\S]*?)<\\/(?:span|div)>','i').exec(html)?.[1]??'').trim()
 function listedTime(text,now){
@@ -46,6 +48,20 @@ export class NativeTiebaMentions{
   if(!found?.author_uid||!found.text?.trim()||!Number.isSafeInteger(found.source_at)||found.source_at<=0)throw new TiebaError('真实艾特楼正文或作者不可定位，未改发主帖','target_not_resolved')
   return{...row,is_sub_reply,text:found.text,source_at:found.source_at,actor:{uid:found.author_uid,name:row.actor_name},quote_author:{uid:''},context:row.title}
  }
+ async topicContext(row,cred,self_uid,cache){
+  const key=row.thread_id+':'+row.forum_id;let topic=cache.get(key)
+  if(!topic){
+   const page=await this.service._postPage(row.thread_id,1,cred);this.service._assertRun()
+   if(page.thread_id!==row.thread_id||page.forum_id!==row.forum_id)throw new TiebaError('艾特所属主题或贴吧未通过核验','target_not_resolved')
+   const roots=page.posts.filter(post=>post.floor===1)
+   if(roots.length!==1)throw new TiebaError('帖子首楼尚未唯一定位，暂不判断艾特来信','target_not_resolved')
+   const root=roots[0],record=tiebaContextRecord(root,{self_uid,topic_author_uid:root.author_uid,max_chars:800})
+   if(!record)throw new TiebaError('帖子首楼作者或正文不可核验，暂不判断艾特来信','target_not_resolved')
+   topic={record,source_at:root.source_at};cache.set(key,topic)
+  }
+  if(Number.isSafeInteger(topic.source_at)&&topic.source_at>0&&topic.source_at>row.source_at)throw new TiebaError('帖子首楼时间晚于来信，暂不判断艾特来信','target_not_resolved')
+  return {thread_id:row.thread_id,title_preview:redactText(String(row.title??'').slice(0,200).toWellFormed()),title_source:'official_notification_preview',topic:topic.record,authority:'quoted_public_source'}
+ }
  async seed(){return this.poll({force:true,seed_only:true})}
  async poll({force=false,seed_only=false}={}){if(this.flight)return this.flight;this.flight=this._poll({force,seed_only});try{const result=await this.flight;this.health={...result,checked_at:this.service._now()};return result}catch(error){this.health={polled:false,queued:0,unresolved:1,reason:error.code??'check_failed',checked_at:this.service._now()};throw error}finally{this.flight=null}}
  async _poll({force,seed_only}){
@@ -54,19 +70,27 @@ export class NativeTiebaMentions{
   if(!force&&state.value.last_poll_at&&now-state.value.last_poll_at<(cfg.poll_interval_ms??60000))return{polled:false,queued:0}
   const cred=await s._credential(),account=await s._self(cred),bound=this.store.listPlatformIdentities({namespace:'tieba',role:'account',entity_id:s._settings().value.account_entity_id,limit:10});s._assertRun()
   if(!bound.some(p=>p.platform_uid===account.uid))throw new TiebaError('艾特监测账号与绑定账号不同','account_mismatch')
-  const first=await this.readPage(1,cred),seed=seed_only||!state.value.baseline&&cfg.seed_on_start!==false,seen=new Set(state.value.seen_ids),rows=new Map(first.items.map(r=>[r.reply_id,r]));let tail=first,pages=1,queued=0,already_handled=0,observed=0;const errors=[]
+  const first=await this.readPage(1,cred),seed=seed_only||!state.value.baseline&&cfg.seed_on_start!==false,seen=new Set(state.value.seen_ids),rows=new Map(first.items.map(r=>[r.reply_id,r])),topics=new Map();let tail=first,pages=1,queued=0,already_handled=0,observed=0;const errors=[]
   const before=row=>seen.has(row.reply_id)||row.source_at!==null&&row.source_at+60000<=state.value.watermark_at
   if(seed){for(const row of first.items)seen.add(row.reply_id)}else{
    while(tail.has_more&&!tail.items.every(before)&&pages<(cfg.max_pages??10)){s._assertRun();tail=await this.readPage(++pages,cred);for(const row of tail.items)rows.set(row.reply_id,row)}
    for(const preview of [...rows.values()].reverse()){
     s._assertRun();if(seen.has(preview.reply_id))continue
+    if(tiebaBarRepliesIgnored(s._settings().config,preview.bar)){seen.add(preview.reply_id);already_handled++;continue}
     if(before(preview)||s.replies.existing(preview)||this.store.db.prepare("SELECT id FROM actions WHERE platform='tieba' AND kind='activity.incoming' AND json_extract(metadata_json,'$.execution')='model' AND json_extract(target_json,'$.thread_id')=? AND json_extract(target_json,'$.source_message_id')=? LIMIT 1").get(preview.thread_id,preview.reply_id)){seen.add(preview.reply_id);already_handled++;continue}
-    try{const row=await this.locate(preview,cred);s._assertRun();if(row.source_at<state.value.watermark_at||row.actor.uid===account.uid){seen.add(row.reply_id);already_handled++;continue}const{target,source_context,public_image_sources}=await s.replies.resolve(row,cred,{self_uid:account.uid});s._assertRun();if(!source_context.mentioned_self){if(source_context.address_kind==='third_party'){seen.add(row.reply_id);already_handled++;continue}throw new TiebaError('原楼没有核实提及当前账号UID','target_not_resolved')}
-     if(tiebaReplyPaused(s._settings().config,row.actor.uid,s._now(),row.source_at)||s.participation?.paused({platform:'tieba',actor_uid:row.actor.uid,conversation_id:'thread:'+row.thread_id+':'+target.post_id,source_at:row.source_at,source_message_id:row.reply_id})){seen.add(row.reply_id);already_handled++;continue}
+    try{const row=await this.locate(preview,cred);s._assertRun();if(row.source_at<state.value.watermark_at||row.actor.uid===account.uid){seen.add(row.reply_id);already_handled++;continue}const{target,source_context,mention_labels,public_image_sources,speaker,quoted_context,nearby_context}=await s.replies.resolve(row,cred,{self_uid:account.uid});s._assertRun();if(!source_context.mentioned_self){if(source_context.address_kind==='third_party'){seen.add(row.reply_id);already_handled++;continue}throw new TiebaError('原楼没有核实提及当前账号UID','target_not_resolved')}
+     if(tiebaThreadReplyPaused(s._settings().config,row.thread_id,s._now(),row.source_at,{unknown_source_blocks:true})||tiebaReplyPaused(s._settings().config,row.actor.uid,s._now(),row.source_at)||s.participation?.paused({platform:'tieba',actor_uid:row.actor.uid,conversation_id:'thread:'+row.thread_id+':'+target.post_id,source_at:row.source_at,source_message_id:row.reply_id})){seen.add(row.reply_id);already_handled++;continue}
+     const thread_context=await this.topicContext(row,cred,account.uid,topics);s._assertRun()
+     if(tiebaBarRepliesIgnored(s._settings().config,target.bar)){seen.add(row.reply_id);already_handled++;continue}
+     if(tiebaThreadReplyPaused(s._settings().config,row.thread_id,s._now(),row.source_at,{unknown_source_blocks:true})||tiebaReplyPaused(s._settings().config,row.actor.uid,s._now(),row.source_at)||s.participation?.paused({platform:'tieba',actor_uid:row.actor.uid,conversation_id:'thread:'+row.thread_id+':'+target.post_id,source_at:row.source_at,source_message_id:row.reply_id})){seen.add(row.reply_id);already_handled++;continue}
      if(this.accountKey()!==state.value.account_key||s._settings().value.credential_ref!==cred.secret_ref)throw new TiebaError('艾特监测账号已变化','account_changed')
      const conversation_id='thread:'+row.thread_id+':'+target.post_id;s._rememberForum(row.thread_id,row.bar);observed++
      const evidence=s.memoryRuntime?.ingestHumanMessage?await s.memoryRuntime.ingestHumanMessage({platform:'tieba',conversation_id,actor_uid:row.actor.uid,display_name:row.actor.name,text:row.text,source_message_id:'reply:'+row.reply_id,source_at:row.source_at,visibility:'public'}):s.replies.memory.recordEvidence({platform:'tieba',conversation_id,actor_uid:row.actor.uid,direction:'in',kind:'message',text:row.text,source_message_id:'reply:'+row.reply_id,source_at:row.source_at,source_type:'user',visibility:'public',source:{kind:'user',explicit:false,pipeline:'native-tieba-mentions'}})
-     s._assertRun();const result=s.activity.enqueueIncoming({platform:'tieba',kind:'incoming',trigger:force?'manual':'incoming',human:true,heavy:false,idempotency_key:'tieba:replies:'+this.accountKey()+':'+row.reply_id,source_evidence_id:evidence.id,target:{...target,channel:'comment',conversation_id,actor_uid:row.actor.uid,source_message_id:row.reply_id},body:row.text},{public_context:packTiebaIncomingImageContext({source_context,quoted_context:{text:row.context,author_uid:null,authority:'quoted_public_source'},notification_kind:'mention'},public_image_sources)});if(!result.duplicate)queued++;seen.add(row.reply_id)
+     const context={source_context:{...source_context,topic_author_uid:thread_context.topic.author_uid},...(mention_labels?.length?{mention_labels}:{}),...(speaker?{speaker:{...speaker,name_verification:'notification_preview'}}:{}),thread_context,...(quoted_context?{quoted_context}:{}),...(nearby_context?.records.length?{nearby_context}:{}),notification_kind:'mention'}
+     while(nearby_context?.records.length&&JSON.stringify(context).length>3900)nearby_context.records.shift()
+     let packed=packTiebaIncomingImageContext(context,public_image_sources)
+     while(nearby_context?.records.length&&JSON.parse(packed).public_images_omitted){nearby_context.records.shift();packed=packTiebaIncomingImageContext(context,public_image_sources)}
+     s._assertRun();const result=s.activity.enqueueIncoming({platform:'tieba',kind:'incoming',trigger:'incoming',human:true,heavy:false,idempotency_key:'tieba:replies:'+this.accountKey()+':'+row.reply_id,source_evidence_id:evidence.id,target:{...target,channel:'comment',conversation_id,actor_uid:row.actor.uid,source_message_id:row.reply_id},body:row.text},{public_context:packed});if(!result.duplicate)queued++;seen.add(row.reply_id)
     }catch(error){s._assertRun();errors.push({reply_id:preview.reply_id,code:error.code??'queue_failed'});if(['verification_required','risk_pause','authentication_required','account_changed'].includes(error.code))break}
    }
   }

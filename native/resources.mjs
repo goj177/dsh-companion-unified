@@ -19,6 +19,14 @@ const physical=directory=>{
 }
 const publicError=message=>Object.assign(new Error(message),{code:'resource_unavailable'})
 
+export function sameNativeWorkspace(cwd,workspace){
+  if(cwd===workspace)return true
+  if(typeof cwd!=='string'||path.dirname(cwd)!==path.dirname(workspace)||!/^[a-f0-9]{64}$/.test(path.basename(cwd)))return false
+  // Old DSH session headers keep their original path. An explicitly merged
+  // companion workspace has a direct link back to the shared home.
+  try{return fs.lstatSync(cwd).isSymbolicLink()&&path.resolve(path.dirname(cwd),fs.readlinkSync(cwd))===workspace}catch{return false}
+}
+
 /** Used before opening the store during an offline restore. */
 export function assertNativeRuntimeQuiescent({data_root,runtime_root}={}){
   if(typeof data_root!=='string'||!path.isAbsolute(data_root)||typeof runtime_root!=='string'||!path.isAbsolute(runtime_root))throw new Error('需明确原生资料及运行目录')
@@ -90,6 +98,9 @@ export class NativeResources {
   workspace(id){
     if(typeof id!=='string'||!id||id.length>512||/[\0\r\n]/.test(id))throw new Error('工作区标识无效')
     return physical(path.join(this.root,'workspaces',hash(id)))
+  }
+  sameWorkspace(cwd,workspace){
+    return sameNativeWorkspace(cwd,workspace)
   }
   _tool(name){
     const configured=this.tools[name],candidates=configured?[configured]:[path.join('/opt/homebrew/bin',name),path.join('/usr/local/bin',name),path.join('/usr/bin',name)]

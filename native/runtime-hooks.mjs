@@ -7,6 +7,7 @@ import {scopeNativeToolDefinitions} from './tool-scope.mjs'
 import {NATIVE_SOURCE_CONTEXT_GUIDE} from './source-context.mjs'
 import {NATIVE_MAINTENANCE_READ_GUIDE} from './task-prompt.mjs'
 import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
+import {isMoneyBudgetProvider} from './money-budget.mjs'
 
 const installed=new WeakMap()
 const sidOf=value=>value?.agent?.session?.header?.id??value?.agent?.session?.id??value?.session?.header?.id??value?.session?.id??value?.header?.id??value?.id??''
@@ -16,14 +17,14 @@ const pickContext=value=>Object.fromEntries(contextKeys.filter(key=>value?.[key]
 const memoryRead=new Set(['memory_search','memory_read','memory_journal','memory_pending','companion_persona','qq_read_asset'])
 const maintenanceRead=new Set(['memory_search','memory_read','memory_journal','memory_pending'])
 const memoryOnly=new Set([...maintenanceRead,'memory_remember'])
-const qqAnswers=new Set([...maintenanceRead,'qq_read_asset','memory_remember','memory_update','companion_learning','companion_mood','companion_diary','companion_expression','qq_send_image','qq_send_voice','qq_send_video','qq_send_forward'])
+const qqAnswers=new Set([...maintenanceRead,'qq_read_asset','memory_remember','memory_update','companion_learning','companion_mood','companion_diary','companion_expression','qq_send_image','qq_send_voice','qq_send_video','qq_send_forward','search_meme_wiki'])
 const optional=(port,method,...args)=>typeof port?.[method]==='function'?port[method](...args):undefined
 const short=(value,limit)=>{if(value===undefined||value===null)return '';if(typeof value!=='string')throw new Error('原生上下文callback必须同步返回文本');return value.length<=limit?value:''}
 /** Native services only. The caller registers publication/social tools; these
  * hooks bind real SDK sources, apply monotonic execution guards and assemble
  * stable persona plus a small task-related context. */
 export function installNativeRuntimeHooks(ctx,options={}){
-  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','affect','speech','references','learning','expression','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','maintenance_guard','tool_profile','now','register_memory_tools','register_profile_tool','register_image_tool'])
+  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','affect','speech','references','learning','expression','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','maintenance_guard','tool_profile','on_image_viewed','now','register_memory_tools','register_profile_tool','register_image_tool','channel_model'])
   const {store,profiles,memory_runtime:memory,qq,session_runner:runner}=options
   if(!(store instanceof NativeStore)||!(profiles instanceof NativeProfileService)||!(memory instanceof NativeMemoryRuntime)||profiles.store!==store||memory.store!==store)throw new Error('运行钩子必须使用同一NativeStore的原生人设和记忆服务')
   if(options.host_context_resolver!==undefined&&typeof options.host_context_resolver!=='function')throw new Error('host_context_resolver必须为可信宿主函数')
@@ -47,15 +48,24 @@ export function installNativeRuntimeHooks(ctx,options={}){
     return {session_id:sid,platform:'harness',conversation_id:'',actor_uid:'',owner_authorized:false,include_secret:false}
   }
   memory.context_resolver=context
-  const platform=agent=>{const resolved=context({agent}),value=options.persona_resolver?.(agent,resolved)
-    if(value!==undefined&&value!==null){if(!['main','qq','tieba','bilibili'].includes(value))throw new Error('人格舞台必须由可信工作区绑定提供');return value}
+  const platform=agent=>{const resolved=context({agent})
+    if(options.persona_resolver){
+      const value=options.persona_resolver(agent,resolved)
+      if(value===null)return null
+      if(!['main','qq','tieba','bilibili'].includes(value))throw new Error('人格舞台必须由可信工作区绑定提供')
+      return value
+    }
     return ['qq','tieba','bilibili'].includes(resolved.platform)?resolved.platform:'main'}
+  const activePersona=agent=>{const stage=platform(agent);return stage!==null&&profiles.enabled(stage)?stage:null}
   const policy=()=>effectiveActivityPolicy({store,now})
   const metadata=agent=>({agent,context:context({agent}),platform:platform(agent)})
   const sourceReview=agent=>runner?.task(sidOf(agent))?.maintenance_kind==='learning'
   const section=spec=>{const off=ctx.systemPrompt.section(spec);if(typeof off==='function')disposers.push(off)}
-  section({name:'companion:persona',order:120,text:({agent}={})=>context({agent}).memory_only||sourceReview(agent)?'':profiles.render(platform(agent))})
-  if(options.speech?.section)section({name:'companion:speech',order:130,text:({agent}={})=>context({agent}).memory_only||sourceReview(agent)?'':short(options.speech.section(metadata(agent)),500)})
+  section({name:'companion:persona',order:120,text:({agent}={})=>{
+    const stage=activePersona(agent)
+    return stage===null||context({agent}).memory_only||sourceReview(agent)?'':profiles.render(stage)
+  }})
+  if(options.speech?.section)section({name:'companion:speech',order:130,text:({agent}={})=>activePersona(agent)===null||context({agent}).memory_only||sourceReview(agent)?'':short(options.speech.section(metadata(agent)),500)})
   section({name:'companion:source-context',order:135,text:({agent}={})=>context({agent}).memory_only||runner?.task(sidOf(agent))?'':NATIVE_SOURCE_CONTEXT_GUIDE})
   const memoryGuide=({agent}={})=>{
     const task=runner?.task(sidOf(agent))
@@ -69,7 +79,7 @@ export function installNativeRuntimeHooks(ctx,options={}){
     try{
       const resolved=context({agent}),input={agent,context:resolved,platform:platform(agent)},lines=[]
       if(runner?.task(sidOf(agent))?.study_closing)lines.push('【本轮收尾】本轮已取得11帖真实阅读来源，并已有原生发表动作。现在只用一句简短自然的话结束，不再浏览、学习或调用工具。已准备动作仍走原发表队列；未确认的动作不能声称已发表。')
-      if(!resolved.memory_only&&!sourceReview(agent)&&runner?.task(sidOf(agent))?.maintenance_kind!=='people'){
+      if(activePersona(agent)!==null&&!resolved.memory_only&&!sourceReview(agent)&&runner?.task(sidOf(agent))?.maintenance_kind!=='people'){
         if(options.people?.context){const familiar=Object.fromEntries(['session_id','workspace_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','read_memory'].filter(key=>resolved[key]!==undefined).map(key=>[key,resolved[key]]));familiar.public_summary_enabled=store.getDocument('settings')?.value.familiarity?.public_summary_enabled===true;lines.push(short(options.people.context(familiar),180))}
         const learned=learning('context',input)??'',voice=optional(options.expression,'context',input)??'',expression=voice&&learned.length+voice.length+1<=1000?[learned,voice].filter(Boolean).join('\n'):learned
         lines.push(short(affect('context',input)??optional(options.mood,'context',input),240),short(optional(options.references,'context',input),360),short(optional(options.speech,'context',input),120),short(expression,1000),short(optional(options.social,'context',input),380))
@@ -85,13 +95,22 @@ export function installNativeRuntimeHooks(ctx,options={}){
   if(options.register_memory_tools!==false)for(const tool of memory.tools())register(tool)
   const jsonOutput={schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:stringifyJson(value)}]}
   if(options.register_profile_tool!==false)register({name:'companion_persona',description:'只读查看主稿或指定平台当前有效人设；按该平台选择的人设来源和跟随开关解析。',parameters:{type:'object',properties:{platform:{type:'string',enum:['main','qq','tieba','bilibili']}},additionalProperties:false},output:jsonOutput,
-    async execute(args={},exec){fields(args,['platform']);const current=platform(exec?.agent),requested=args.platform??current;if(requested!==current&&context(exec).owner_authorized!==true)throw new Error('当前来源只能读取本平台生效人设，不能读取其他平台稿');return {platform:requested,...profiles.resolve(requested)}}})
+    async execute(args={},exec){
+      fields(args,['platform'])
+      const current=platform(exec?.agent)
+      if(current===null)throw new Error('当前会话不在「欧鲸鲸的家」')
+      const requested=args.platform??current
+      if(requested!==current&&context(exec).owner_authorized!==true)throw new Error('当前来源只能读取本平台生效人设，不能读取其他平台稿')
+      if(!profiles.enabled(requested))throw new Error('该平台人设已关闭')
+      return {platform:requested,...profiles.resolve(requested)}
+    }})
   if(options.register_image_tool!==false)register({name:'qq_read_asset',description:'查看当前QQ会话有权读取的原生图片asset_ref；原图字节经SDK正规图像附件显示，不把base64当文本。',parameters:{type:'object',properties:{asset_ref:{type:'string'}},required:['asset_ref'],additionalProperties:false},
     output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'image',attachment:value.attachment}]},
     async execute(args,exec){fields(args,['asset_ref']);const resolved=context(exec);if(resolved.platform!=='qq'||!resolved.conversation_id||!qq?.readAsset)throw new Error('此图像工具只接当前可信QQ会话')
       const value=await qq.readAsset(args.asset_ref,{conversation_id:resolved.conversation_id});if(!value.media_type.startsWith('image/'))throw new Error('该素材不是可显示的图片')
       const attachments=ctx.get?.('attachments')??ctx.attachments;if(!attachments?.saveImages)throw new Error('宿主正规图像附件服务尚未就绪')
       const refs=await attachments.saveImages([{data:value.bytes,mediaType:value.media_type,name:args.asset_ref}]);if(!refs[0]?.attachmentId)throw new Error('宿主未返回已登记ImageAttachmentRef')
+      options.on_image_viewed?.(args.asset_ref,exec)
       return {asset_ref:args.asset_ref,attachment:refs[0]}
     }})
   const allowed=(agent)=>{
@@ -105,20 +124,29 @@ export function installNativeRuntimeHooks(ctx,options={}){
     if(task.batch.tasks.some(row=>row.target?.no_publication===true))return new Set([...memoryOnly,'companion_persona','companion_expression','companion_read','companion_image','companion_diary','companion_learning','companion_speech'])
     const names=optional(options.social,'allowed_tool_names',{agent,context:resolved,platform:resolved.platform})??[]
     if(!Array.isArray(names)||names.some(name=>typeof name!=='string'))throw new Error('社交能力必须显式提供工具名列表')
-    return new Set([...memoryOnly,'companion_persona','companion_expression','companion_learning','qq_read_asset',...names])
+    return new Set([...memoryOnly,'companion_persona','companion_expression','companion_learning','qq_read_asset','search_meme_wiki',...names])
   }
   const toolScopes=new Map()
   const releaseTools=agent=>{const off=toolScopes.get(agent);if(!off)return;toolScopes.delete(agent);for(const dispose of off.reverse())dispose()}
   const scopeTools=agent=>{
-    if(!agent||typeof ctx.tools.definitions!=='function')return
+    if(!agent)return
+    const sid=sidOf(agent),task=runner?.task(sid)
+    // Refresh long-lived QQ agents before the next turn. A running turn keeps
+    // the provider and effort already fixed by the host.
+    const qqNext=!task&&agent.status!=='running'&&qq?.chatForSession(sid)
+    if(task||qqNext){
+      const selected=agent.model?.current?.(),next=options.channel_model?.()
+      if(next&&selected&&typeof agent.model?.select==='function'){
+        if(selected.provider!==next.provider||selected.model!==next.model||selected.reasoningEffort!==next.reasoningEffort)agent.model.select(next)
+      }
+    }
+    if(typeof ctx.tools.definitions!=='function')return
     releaseTools(agent)
     const names=allowed(agent);if(!names)return
     const scoped=agent.ctx?.tools
     if(typeof scoped?.restrict!=='function'||typeof scoped?.register!=='function')throw new Error('当前SDK缺少智能体独立工具注册接口')
-    const task=runner?.task(sidOf(agent)),globalNames=new Set(ctx.tools.definitions().map(tool=>tool.name))
-    const selected=agent.model?.current?.(),effort=task?.batch.model?.reasoning_effort
-    if(selected&&effort&&selected.reasoningEffort!==effort&&typeof agent.model?.select==='function')agent.model.select({...selected,reasoningEffort:effort})
-    const tools=scopeNativeToolDefinitions(ctx.tools.definitions(agent).filter(tool=>names.has(tool.name)),platform(agent),options.tool_profile?.(task)??{})
+    const globalNames=new Set(ctx.tools.definitions().map(tool=>tool.name))
+    const tools=scopeNativeToolDefinitions(ctx.tools.definitions(agent).filter(tool=>names.has(tool.name)),task?.batch.platform??platform(agent),options.tool_profile?.(task)??{})
     const off=[scoped.restrict({allow:tools.map(tool=>tool.name).filter(name=>globalNames.has(name))})]
     toolScopes.set(agent,off)
     try{for(const tool of tools)off.push(scoped.register(tool,{when:()=>{
@@ -187,17 +215,20 @@ export function installNativeRuntimeHooks(ctx,options={}){
     if(!task&&!['qq','tieba','bilibili'].includes(resolved.platform))return options.money_budget?.enabled()?{...request,maxTokens:Math.min(request.maxTokens??32768,32768)}:request
     const peak=!valleyDecision(now(),p).valley,output=task?.maintenance_kind==='people'?Math.min(task.batch.model?.max_output_tokens??1600,1600):resolved.memory_only?1200:task?.batch.model?.max_output_tokens??(peak?p.model?.peak_max_output_tokens??900:p.model?.max_output_tokens??1800)
     const closing=task?.study_closing===true
-    return {...request,reasoningEffort:task?.batch.model?.reasoning_effort??p.model?.reasoning_effort??'low',maxTokens:Math.min(request.maxTokens??Infinity,output,closing?768:Infinity)}
+    const maxTokens=Math.min(request.maxTokens??Infinity,output,closing?768:Infinity)
+    return {...request,maxTokens}
   })
   on('llm/stream',(request,next)=>{
     if(!store.readOnly)restoreExpiredBudgetOverrides({store,now})
     const task=runner?.task(request?.sessionId),chat=qq?.chatForSession(request?.sessionId)
-    const invoke=()=>!task&&!chat&&!options.money_budget?.enabled()?next():(async function*(){const sdk=await runner.controller.sdk(),through=task?(start=>runner.stream(request,start,{is_loop_request:sdk.isAgentLoopRequest(request)})):undefined,money=options.money_budget
-      if(money)yield* money.stream(request,next,{scope:task?'activity':chat?'qq':'harness',platform:task?.batch.platform??(chat?'qq':'harness'),through});else yield* (through?through(next):next())
-    })()
-    if(!options.affect&&!options.learning?.stream)return invoke()
     return (async function*(){
       let loop=false;try{const sdk=await runner?.controller?.sdk?.();loop=sdk?.isAgentLoopRequest?.(request)===true}catch{warn()}
+      const through=task?(start=>runner.stream(request,start,{is_loop_request:loop})):undefined
+      const money=options.money_budget
+      const invoke=()=>{
+        if(money&&isMoneyBudgetProvider(request.provider)&&(task||chat||money.enabled()))return money.stream(request,next,{scope:task?'activity':chat?'qq':'harness',platform:task?.batch.platform??(chat?'qq':'harness'),through})
+        return through?through(next):next()
+      }
       const learned=()=>loop?learning('stream',request,invoke,{is_loop_request:true})??invoke():invoke()
       yield* (loop?affect('stream',request,learned,{context:context({agent:{session:{id:request?.sessionId}}}),is_loop_request:true})??learned():invoke())
     })()

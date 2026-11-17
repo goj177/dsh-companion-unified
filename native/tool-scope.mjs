@@ -19,7 +19,7 @@ function incomingActionKinds(profile,platform,available){
 }
 function incomingActionDescription(platform,kinds){
   const finish='mode=go执行，dry只预览；unknown不重发，confirmed回执才算确认。'
-  if(platform==='bilibili')return '本轮仅bilibili.reply，回复已核验原对象和原位置。评论target照抄object_id/object_type/root_reply_id/parent_reply_id，ID用字符串、object_type是数字字符串而非video；dm保留channel/recipient_uid/conversation_id，live保留channel/room_id/reply_uid及已有reply_dmid。'+finish
+  if(platform==='bilibili')return '本轮仅bilibili.reply，回复已核验原对象和原位置。评论target照抄object_id/object_type/root_reply_id/parent_reply_id，ID用字符串、object_type是数字字符串而非video；评论可用target.asset_ids附共享表情包。dm保留channel/recipient_uid/conversation_id，live保留channel/room_id/reply_uid及已有reply_dmid。'+finish
   return '本轮只回应原对象和原位置。'+(kinds.includes('tieba.reply')?'tieba.reply：target照抄bar/thread_id/post_id及存在的sub_reply_id/reply_uid，不改发新楼；表情填target.emotes，收藏图片填target.asset_ids；表情每条最多3个、收藏图最多1张；已列出的可用候选直接引用，其他候选再查emotes/images。'+TIEBA_REPLY_INTENT_GUIDE:'')+(kinds.includes('tieba.message')?'tieba.message：target照抄recipient_uid/conversation_id=dm:同一UID，只回原私信，不公开发帖或联系其他人。':'')+finish
 }
 
@@ -32,7 +32,12 @@ export function scopeNativeToolDefinitions(tools,platform,profile){
     if(tool.name==='companion_persona')return {...tool,parameters:{...tool.parameters,properties:{platform:{type:'string',enum:[platform]}}}}
     if(tool.name!=='companion_action'||!Array.isArray(tool.parameters?.properties?.kind?.enum))return tool
     const available=tool.parameters.properties.kind.enum.filter(kind=>kind.startsWith(platform+'.')),incoming=incomingActionKinds(profile,platform,available)
-    const kinds=incoming??available,target=platform==='tieba'&&kinds.includes('tieba.reply')?{...tool.parameters.properties.target,type:'object',properties:{...tool.parameters.properties.target?.properties,intent:{type:'string',enum:[...TIEBA_REPLY_INTENTS],description:'仅tieba.reply可选，填写在target内部；例如target:{bar,thread_id,intent:"chat"}。不可放companion_action顶层。'}}}:tool.parameters.properties.target
+    const kinds=incoming??available,target=platform==='tieba'&&kinds.includes('tieba.reply')?{...tool.parameters.properties.target,type:'object',properties:{
+      ...tool.parameters.properties.target?.properties,
+      emotes:{type:'array',maxItems:3,items:{type:'string'},description:'贴吧自带表情，使用 emotes 查询返回的真实名称。'},
+      asset_ids:{type:'array',maxItems:1,items:{type:'string',pattern:'^asset:[a-f0-9]{64}$'},description:'表情包或收藏图片，使用当前吧 images 查询返回的完整素材 ID。'},
+      intent:{type:'string',enum:[...TIEBA_REPLY_INTENTS],description:'仅tieba.reply可选，填写在target内部；例如target:{bar,thread_id,intent:"chat"}。不可放companion_action顶层。'},
+    }}:tool.parameters.properties.target
     return {...tool,description:incoming?incomingActionDescription(platform,incoming):common+descriptions[platform],parameters:{...tool.parameters,properties:{...tool.parameters.properties,kind:{...tool.parameters.properties.kind,enum:kinds},...(target?{target}:{})}}}
   })
 }

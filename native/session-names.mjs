@@ -1,6 +1,7 @@
 import {createHash} from 'node:crypto'
 import path from 'node:path'
 import {NativeStore} from './store.mjs'
+import {NATIVE_HOME_WORKSPACE_ID} from './defaults.mjs'
 
 const hash=value=>createHash('sha256').update(value).digest('hex')
 const clean=value=>[...String(value??'').replace(/\[CQ:[^\]]*\]/g,'').replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g,'').replace(/\s+/g,' ').trim()].slice(0,16).join('')
@@ -30,7 +31,7 @@ export class NativeSessionNames{
   const conversation=input.platform==='qq'?input.conversation_id:bound?.conversation_id??source?.conversation_id
   const ref=/^(private|group):([1-9]\d*)$/.exec(conversation??'')
   const date=sessionNameTime(session.header.createdAt??this.now())
-  if(!ref){const qqIds=new Set(['workspace:qq',...bindings.map(x=>x.workspace_id)]),root=path.dirname(this.store.file),known=[...qqIds].some(id=>session.header.cwd===path.join(root,'workspaces',hash(id)));return known?{title:'QQ · 本地会话（无聊天绑定）· '+date}:null}
+  if(!ref){const qqIds=new Set(['workspace:qq',...bindings.map(x=>x.workspace_id)]),root=path.dirname(this.store.file);qqIds.delete(NATIVE_HOME_WORKSPACE_ID);const known=[...qqIds].some(id=>session.header.cwd===path.join(root,'workspaces',hash(id)));return known?{title:'QQ · 本地会话（无聊天绑定）· '+date}:null}
   const [,kind,uid]=ref,current=input.platform==='qq'||bound&&!bound.retired,autonomous=input.purpose==='autonomous'
   let label
   if(kind==='group'){const cached=this._cache('session-group:'+uid);label='群聊'+(cached?.name?' · '+cached.name:'')+'（'+uid+'）';if(!cached)this._refreshGroup(uid,session)}
