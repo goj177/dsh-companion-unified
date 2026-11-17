@@ -14,6 +14,7 @@ const sidOf = value => value?.agent?.session?.header?.id??value?.agent?.session?
 const sessionOf = value=>value?.agent?.session??value?.session??value
 const textOf = content=>typeof content==='string'?content:Array.isArray(content)?content.filter(block=>block?.type==='text'&&typeof block.text==='string').map(block=>block.text).join('\n'):''
 const SOURCE_KIND='plugin:companion-memory'
+const RECALL_LIMIT=10
 const CONTEXT_FIELDS=['session_id','workspace_id','source_session_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','allow_global_summary','memory_only','query','read_memory','write_memory']
 const SEARCH_FIELDS=['query','platform','conversation_id','since','until','limit','max_chars','entity_id','level','project','goal']
 const WRITE_FIELDS=['content','level','subject','predicate','object','memory_type','evidence_ids','scope','entity_type','actor_uid','actor_entity_id','conversation_id','platform','valid_from','valid_until','correction','supersedes','title','project','importance','keywords','subcategory','goal','corrected']
@@ -249,14 +250,16 @@ export class NativeMemoryRuntime {
       const actor=row.direction==='out'?'助手（仅确认发出）':'原发言者 '+clip(row.actor_uid||'未记录',32),at=row.source_at===null?'时间未记录':new Date(row.source_at).toISOString(),label='历史原话；'+actor+'；'+at+'；未独立核验正文事实'
       const prefix='['+label+' '+row.id+'] ',room=max_chars-used-prefix.length-(lines.length?1:0)
       if(room<12)continue
-      const chunk=page(row.text,{max_chars:Math.min(320,room)}),line=prefix+chunk.text,offset=(row.offset??0)+chunk.offset,total_chars=row.total_chars??row.text.length,next=offset+chunk.text.length
+      const slots=Math.min(candidates.length,limit)-items.length
+      const share=limit>8?Math.max(12,Math.floor((room+prefix.length+1)/slots)-prefix.length-1):320
+      const chunk=page(row.text,{max_chars:Math.min(320,room,share)}),line=prefix+chunk.text,offset=(row.offset??0)+chunk.offset,total_chars=row.total_chars??row.text.length,next=offset+chunk.text.length
       items.push({...row,...chunk,offset,total_chars,next_offset:next<total_chars?next:null,label,source:'evidence',untrusted:true});lines.push(line);used+=line.length+(lines.length>1?1:0)
     }
     return {items,text:lines.join('\n'),abstained:items.length===0,untrusted:true,historical:true}
   }
   search(args={},exec) {
     fields(args,SEARCH_FIELDS,'memory_search');const context=readContext(this._require(exec,'read')),configured=integer(this.settings().memory?.hit_limit??2,'hit_limit',0,50)
-    const limit=args.limit===undefined?Math.min(8,configured+1):Math.min(8,integer(args.limit,'limit',1,30)),q=this.memory._query({...args,limit}),cap=q.max_chars
+    const limit=args.limit===undefined?Math.min(RECALL_LIMIT,configured+1):Math.min(RECALL_LIMIT,integer(args.limit,'limit',1,30)),q=this.memory._query({...args,limit}),cap=q.max_chars
     const extraItems=[],lines=[];let used=0
     if(this.learningLoop&&!SEARCH_FIELDS.some(key=>!['query','platform','limit','max_chars'].includes(key)&&args[key]!==undefined)){
       const learned=this.learningLoop.searchMemory({query:q.query,...(args.platform!==undefined?{platform:args.platform}:{}),limit:1,max_chars:Math.min(360,cap)},context)
@@ -377,7 +380,7 @@ export class NativeMemoryRuntime {
   guide(){return this.enabled()?NATIVE_MEMORY_GUIDE:''}
   _automaticSource(agent,messages,context){
     const turn=this.turns.get(context.session_id),ids=new Set(turn?.evidence_ids??[])
-    if(context.platform==='tieba'&&this.current_input_source){const source=this.current_input_source({agent,messages,context});if(source){if(!isPlainObject(source)||!Array.isArray(source.parts)||!source.parts.length||source.parts.some(text=>typeof text!=='string')||!Array.isArray(source.evidence_ids)||source.evidence_ids.some(id=>typeof id!=='string')||source.anchor&&!messages.includes(source.anchor))throw new Error('当前来信来源能力无效');return {raw:source.parts.join('\n'),parts:source.parts,source_ids:source.evidence_ids,anchor:source.anchor??null,kind:'trusted_current_activity_input'}}}
+    if(context.platform==='tieba'&&this.current_input_source){const source=this.current_input_source({agent,messages,context});if(source){if(!isPlainObject(source)||!Array.isArray(source.parts)||!source.parts.length||source.parts.some(text=>typeof text!=='string')||!Array.isArray(source.evidence_ids)||source.evidence_ids.some(id=>typeof id!=='string')||source.anchor&&!messages.includes(source.anchor))throw new Error('当前来信来源能力无效');return {raw:source.parts.join('\n'),parts:source.parts,source_ids:source.evidence_ids,anchor:source.anchor??null,bar:source.bar,kind:'trusted_current_activity_input'}}}
     const valid=row=>row&&row.platform===context.platform&&row.conversation_id===context.conversation_id&&row.actor_uid===context.actor_uid&&row.actor_entity_id===context.actor_entity_id&&row.direction==='in'&&row.source_message_id&&row.source_type==='user'&&row.source?.pipeline==='trusted-human-inbound'&&['user','human','user_statement'].includes(row.source?.kind)
     // QQ request messages contain a permission wrapper and SDK user-role
     // instructions/catalog/context. Only a consumed native human source owns
@@ -424,10 +427,14 @@ export class NativeMemoryRuntime {
     try{
       source=this._automaticSource(agent,messages,context);if(!source)return null
       stage='query';const raw=source.parts?source.parts.map(part=>semanticMessageText(part,{platform:context.platform,conversation_id:context.conversation_id})).join('\n'):semanticMessageText(source.raw,{platform:context.platform,conversation_id:context.conversation_id});query=automaticMemoryQuery(raw);if(!query)return null
-      stage='lookup';let result=this.memory.recall({query,limit:Math.min(8,hit_limit),max_chars:remaining},permissions)
-      if(result.abstained)result=this._historyFallback({query},context,{limit:Math.min(8,hit_limit),max_chars:remaining,anchor:source.anchor,source_ids:source.source_ids??[]})
+      const limit=Math.min(RECALL_LIMIT,hit_limit)
+      stage='lookup'
+      const recall={limit,max_chars:remaining}
+      let result=this.memory.recall({query,...recall},permissions)
+      if(result.abstained)result=this._historyFallback({query},context,{...recall,anchor:source.anchor,source_ids:source.source_ids??[]})
+      stage='render'
       if(result.abstained)return null
-      stage='render';const text=(result.historical?historyHeader:header)+result.text
+      const text=(result.historical?historyHeader:header)+result.text
       const signature=digest(stringifyJson([context.platform,context.conversation_id,context.actor_uid,query,text]))
       const seen=this.injections.get(context.session_id)??new Set()
       if(!reinject&&seen.has(signature))return null

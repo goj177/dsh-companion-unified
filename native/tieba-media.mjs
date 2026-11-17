@@ -2,7 +2,7 @@
  * Only trusted native upload receipts supply picture handles; no model URL or HTML.
  * Source: https://tb3.bdstatic.com/tb/pc/pc-main-core/static/js/pb.b69f12af.js
  */
-import {TiebaContentError,assertTiebaPublishableText} from './tieba-content.mjs'
+import {TiebaContentError,assertTiebaPublishableText,assertNoDuplicateTiebaFaces} from './tieba-content.mjs'
 import {parseUploadReceipt} from './tieba-http.mjs'
 import {createHash} from 'node:crypto'
 const pairs=[["image_emoticon","呵呵"],["image_emoticon2","哈哈"],["image_emoticon3","吐舌"],["image_emoticon24","太开心"],["image_emoticon22","笑眼"],["image_emoticon20","花心"],["image_emoticon66","小乖"],["image_emoticon28","乖"],["image_emoticon67","捂嘴笑"],["image_emoticon25","滑稽"],["image_emoticon68","你懂的"],["image_emoticon12","不高兴"],["image_emoticon6","怒"],["image_emoticon8","汗"],["image_emoticon10","黑线"],["image_emoticon9","泪"],["image_emoticon13","真棒"],["image_emoticon33","喷"],["image_emoticon30","惊哭"],["image_emoticon16","阴险"],["image_emoticon11","鄙视"],["image_emoticon5","酷"],["image_emoticon4","啊"],["image_emoticon27","狂汗"],["image_emoticon69","what"],["image_emoticon15","疑问"],["image_emoticon70","酸爽"],["image_emoticon71","呀咩爹"],["image_emoticon19","委屈"],["image_emoticon32","惊讶"],["image_emoticon29","睡觉"],["image_emoticon72","笑尿"],["image_emoticon73","挖鼻"],["image_emoticon17","吐"],["image_emoticon74","犀利"],["image_emoticon75","小红脸"],["image_emoticon76","懒得理"],["image_emoticon26","勉强"],["image_emoticon7","开心"],["image_emoticon14","钱"],["image_emoticon18","咦"],["image_emoticon21","呼~"],["image_emoticon23","冷"],["image_emoticon61","升起"],["image_emoticon97","突然兴奋"],["image_emoticon100","黑头高兴"],["image_emoticon95","欢呼"],["image_emoticon88","嘿嘿嘿"],["image_emoticon91","微微一笑"],["image_emoticon86","吃瓜"],["image_emoticon92","托腮"],["image_emoticon93","摊手"],["image_emoticon90","困成狗"],["image_emoticon85","暗中观察"],["image_emoticon94","柯基暗中观察"],["image_emoticon87","喝酒"],["image_emoticon89","噗"],["image_emoticon98","紧张"],["image_emoticon96","炸药"],["image_emoticon133","香槟"],["image_emoticon99","黑头瞪眼"],["image_emoticon128","望远镜"],["image_emoticon126","不听"],["image_emoticon127","干饭"],["image_emoticon130","老虎"],["image_emoticon131","嗷呜"],["image_emoticon136","鼠1"],["image_emoticon137","鼠2"],["image_emoticon134","文字啊"],["image_emoticon135","文字对"],["image_emoticon132","烟花"],["image_emoticon129","菜狗"],["image_emoticon125","奥特曼"],["image_emoticon34","爱心"],["image_emoticon35","心碎"],["image_emoticon36","玫瑰"],["image_emoticon37","礼物"],["image_emoticon38","彩虹"],["image_emoticon40","太阳"],["image_emoticon39","星星月亮"],["image_emoticon41","钱币"],["image_emoticon43","茶杯"],["image_emoticon44","蛋糕"],["image_emoticon48","大拇指"],["image_emoticon47","胜利"],["image_emoticon46","haha"],["image_emoticon50","OK"],["image_emoticon77","沙发"],["image_emoticon78","手纸"],["image_emoticon79","香蕉"],["image_emoticon80","便便"],["image_emoticon81","药丸"],["image_emoticon82","红领巾"],["image_emoticon83","蜡烛"],["image_emoticon84","三道杠"],["image_emoticon45","音乐"],["image_emoticon42","灯泡"]]
@@ -11,6 +11,11 @@ const names=new Map(pairs.map(([key,name])=>[name,key])),keys=new Map(pairs)
 // Restrict native reply choices to TiebaLite's active *_WEB_MAP entries.
 const wapNames=new Set(['滑稽','呵呵','哈哈','啊','开心','酷','汗','怒','鄙视','不高兴','泪','吐舌','黑线','乖','呼~','花心','惊哭','惊讶','狂汗','冷','勉强','喷','噗','钱','生气','睡觉','太开心','吐','委屈','笑眼','咦','阴险','疑问','真棒','爱心','心碎','玫瑰','礼物','彩虹','星星月亮','太阳','钱币','灯泡','茶杯','蛋糕','音乐','haha','胜利','大拇指','弱','OK'])
 const wapPairs=pairs.filter(([,name])=>wapNames.has(name))
+const faceLabels=new Set([...names.keys(),...wapNames].map(name=>name.toLowerCase()))
+export function assertTiebaPublishableBody(body,emotes=[],{reply=false}={}){
+ if(typeof body==='string'&&body.isWellFormed())assertNoDuplicateTiebaFaces(body,emotes)
+ return assertTiebaPublishableText(body,{knownFace:name=>faceLabels.has(name.toLowerCase()),reply})
+}
 export function tiebaEmotes({query='',limit=12}={}){
  if(typeof query!=='string'||query.length>240||!Number.isSafeInteger(limit)||limit<1||limit>30)throw new TiebaContentError('贴吧表情查询范围无效')
  return {items:wapPairs.filter(([key,name])=>!query||name.includes(query)||key===query).slice(0,limit).map(([key,name])=>({name,emote_id:key})),total:wapPairs.length,...(query?{unsupported_names:pairs.filter(([key,name])=>!wapNames.has(name)&&(name.includes(query)||key===query)).map(([,name])=>name)}:{}),model_calls:0,usage:'仅返回当前回帖通道支持的表情，target.emotes填写name；Unicode emoji可直接写正文。不支持的名称不要手写(#表情名)或#(表情名)'}
@@ -21,7 +26,7 @@ export function checkedTiebaEmotes(values=[]){
  return values
 }
 export function compileTiebaMedia(body,{emotes=[],images=[]}={}){
- assertTiebaPublishableText(body);checkedTiebaEmotes(emotes)
+ checkedTiebaEmotes(emotes);assertTiebaPublishableBody(body,emotes)
  if(!Array.isArray(images)||images.length>1)throw new TiebaContentError('每条最多一张收藏图片')
  return body+emotes.map(name=>'#('+name+')').join('')+images.map(image=>{
   if(!image||!/^[-a-zA-Z0-9_]{1,160}$/.test(image.pic_id)||!Number.isSafeInteger(image.width)||!Number.isSafeInteger(image.height)||image.width<1||image.height<1||image.width*image.height>100000000)throw new TiebaContentError('官方图片上传回执无效')
@@ -33,6 +38,14 @@ export function compileTiebaMedia(body,{emotes=[],images=[]}={}){
 // This face-only serializer deliberately accepts no WAP picture upload handle.
 export function compileTiebaPcMedia(body,{emotes=[]}={}){
  return compileTiebaMedia(body,{emotes})
+}
+// The official topic editor submits getContentUbb(): html2ubb maps each
+// line break to [br] and escapes literal brackets before adding UBB tags.
+export function compileTiebaTopicParagraphs(body){
+ assertTiebaPublishableBody(body)
+ return body.replace(/[&<>]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[char])
+   .replace(/[\[\]]/g,char=>char==='['?'[lbk]':'[rbk]')
+   .replace(/\r\n|[\r\n]/g,'[br]')
 }
 // HTML serialization is retained for the existing theme adapter. Reply media
 // uses the WAP serializer below, which has actual typed-face readback receipts.
@@ -46,7 +59,7 @@ export function compileTiebaWebMedia(body,{emotes=[],images=[]}={}){
 // The mobile web reply API uses (#name), not the new PC editor's #(name).
 // Protocol references: TiebaLite EmotionUtil.REGEX_WEB and WebTiebaApi.webReply.
 export function compileTiebaWapMedia(body,{emotes=[]}={}){
- assertTiebaPublishableText(body);checkedTiebaEmotes(emotes)
+ checkedTiebaEmotes(emotes);assertTiebaPublishableBody(body,emotes)
  return body+emotes.map(name=>'(#'+name+')').join('')
 }
 export function parseTiebaWapPictureUpload(text){

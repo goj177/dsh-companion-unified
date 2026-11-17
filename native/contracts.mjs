@@ -67,6 +67,8 @@ export const PERSONA_VOICE = freeze(object({
 
 const settings = object({
   enabled: boolean, time_zone: string(80), default_persona_id: identifier,
+  expression: object({ media_preference: integer(1,10) }),
+  school: object({interval_seconds: integer(60)}),
   activity_document_id: identifier, mood_document_id: identifier, speech_document_id: identifier, learning_document_id: identifier,
   platform_document_ids: object({ qq: identifier, tieba: identifier, bilibili: identifier }),
   familiarity: object({ sharing: choice('platform','global'), score_version: string(80), max_people: integer(1,3),
@@ -83,9 +85,11 @@ const activity = object({
   batching: object({ batch_ms: integer(), human_batch_ms: integer(), max_batch: integer(1, 1000), max_concurrent: integer(1, 100), max_per_platform: integer(1, 100),
     lease_ms: integer(1), task_timeout_ms: integer(1), min_valley_remaining_ms: integer() }),
   idle: object({ enabled: boolean, min_idle_ms: integer(), explore_every_ms: integer(1), chat_every_ms: integer(1),
-    explore_platforms: array(platform, 6), qq_targets: array(choice('owner','group'), 2) }),
-  qq: object({ owner_conversation: string(240), group_conversations: array(string(240), 1000), profile_authorized: boolean, quiet_start_hour: hour, quiet_end_hour: hour }),
-  model: object({ reasoning_effort: choice('off','low','medium','high','max'), max_output_tokens: integer(1), peak_max_output_tokens: integer(1) }),
+    explore_platforms: array(platform, 6), qq_targets: array(choice('owner','group','contact'), 3) }),
+  qq: object({ owner_conversation: string(240), group_conversations: array(string(240), 1000), private_conversations: array(string(28,{pattern:/^private:[1-9][0-9]{3,19}$/}),1000), profile_authorized: boolean, quiet_start_hour: hour, quiet_end_hour: hour }),
+  // Retain model preferences from older installations and backups. New tasks use the host selection.
+  model: object({ provider: choice('host','gemini-cli'), gemini_model: string(87,{pattern:/^(?:gemini-[a-z0-9][a-z0-9.-]{0,79})?$/}),
+    reasoning_effort: choice('off','low','medium','high','max'), max_output_tokens: integer(1), peak_max_output_tokens: integer(1), tieba_incoming_max_output_tokens: integer(1,64000) }),
   mood_judge: object({ min_interval_minutes: integer(), max_per_day: integer(), reserve_tokens: integer() }),
 }, ['enabled'])
 
@@ -124,6 +128,7 @@ const hormoneState=object({version:choice(1),updated_at:timestamp,day:date,last_
 },['version','updated_at','day','last_work_at','last_user_at','values','debts','emit','rounds','history'])
 
 const qqSettings = object({
+  // Accept retired settings from existing stores and backups.
   expression: object({ persona_source: choice('qq','tieba') }),
   transport: object({ mode: choice('forward','reverse'), url: string(4096), host: string(512), port: integer(0, 65535), credential_ref: identifier,
     connect_timeout_ms: integer(), reconnect_max_attempts: integer() }),
@@ -150,7 +155,9 @@ const qqSettings = object({
 
 const tiebaSettings = object({
   bars: array(string(160), 1000), keywords: array(string(240), 1000),
+  ignored_reply_bars: array(string(160,{nonempty:true}), 1000),
   reply_pauses: array(object({ actor_uid: uid, until: timestamp, skip_before: timestamp, reason: string(2000) }, ['actor_uid','until']), 1000),
+  thread_reply_pauses: array(object({ thread_id: uid, until: timestamp, skip_before: timestamp, reason: string(2000) }, ['thread_id','until','skip_before']), 1000),
   permissions: object({ sign: boolean, follow: boolean, sign_all_followed: boolean, reply: boolean, answer_questions: boolean,
     sub_reply: boolean, new_thread: boolean, images: boolean, experimental_image_post: boolean, direct_message:boolean }),
   inbox:object({enabled:boolean,poll_interval_ms:integer(15000),seed_on_start:boolean,allow_legacy_auth:boolean,auth_until:nullable(timestamp),authorized_peer_uids:array(uid,100),daily_limit:integer(1,500),gap_ms:integer(1000)}),
@@ -180,7 +187,7 @@ const biliSettings = object({
   inbox_document_id: identifier,
 })
 
-const providerSettings = object({ platform: choice('qq','tieba','bilibili'), enabled: boolean, account_entity_id: identifier, credential_ref: identifier,
+const providerSettings = object({ platform: choice('qq','tieba','bilibili'), enabled: boolean, persona_enabled: boolean, account_entity_id: identifier, credential_ref: identifier,
   qq: qqSettings, tieba: tiebaSettings, bilibili: biliSettings }, ['platform','enabled'])
 
 const platformState = object({
@@ -305,6 +312,16 @@ const runtimeLease = object({scope:choice('channels'),holder_id:string(160,{none
   ['scope','holder_id','pid','lease_until','renewed_at'])
 const workspacePersonaBinding = object({workspace_id:string(512,{nonempty:true}),platform:choice('main','qq','tieba','bilibili'),enabled:boolean},
   ['workspace_id','platform','enabled'])
+// Keep existing local catalogs readable during backup and restore.
+const gameWikiCatalog = object({
+  game:string(32,{pattern:/^[a-z0-9_-]+$/}),
+  captured_at:timestamp,
+  entries:array(object({
+    title:string(360,{nonempty:true}),url:string(1200,{pattern:/^https:\/\//}),
+    source:string(120,{nonempty:true}),language:choice('zh','en','ja'),category:string(120),
+    aliases:array(string(120,{nonempty:true}),24),updated:string(40),
+  },['title','url','source','language']),10000),
+},['game','captured_at','entries'])
 
 export const DOCUMENT_CONTRACTS = freeze(Object.fromEntries(Object.entries({
   settings, activity, activity_state: activityState, mood, hormone, hormone_state:hormoneState, platform_settings: providerSettings,
@@ -315,6 +332,7 @@ export const DOCUMENT_CONTRACTS = freeze(Object.fromEntries(Object.entries({
   persona_reference:personaReference,
   runtime_lease:runtimeLease,
   workspace_persona_binding:workspacePersonaBinding,
+  game_wiki_catalog:gameWikiCatalog,
 }).map(([type, value]) => [type, { type, schema_id: 'companion.' + type, schema_version: 1, value }])))
 
 export function validateShape(value, spec, at = '$') {

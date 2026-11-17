@@ -48,18 +48,23 @@ export class NativeProfileService {
     // Both reads use one snapshot if another process edits the main profile.
     return this.store.transaction(() => {
       const own = this._own(platform)
-      const source = platform === 'qq' && this.store.getDocument('qq')?.value.qq?.expression?.persona_source === 'tieba' ? this._own('tieba') : own
-      const effective = source.follow_main ? this.store.getPersonaProfile(source.main_profile_id) : source
-      if (!effective || source.follow_main && effective.platform !== 'main') throw new Error('跟随的主人设不存在，请检查人设设置')
+      const effective = own.follow_main ? this.store.getPersonaProfile(own.main_profile_id) : own
+      if (!effective || own.follow_main && effective.platform !== 'main') throw new Error('跟随的主人设不存在，请检查人设设置')
       return { requested_platform: platform, profile_id: own.id, effective_profile_id: effective.id,
         follow_main: own.follow_main, revision: own.revision, effective_revision: effective.revision,
-        ...(source !== own ? { source_platform: source.platform } : {}),
         name: effective.name, self_ref: effective.self_ref, owner_address: effective.owner_address,
         traits: copy(effective.traits), voice: copy(effective.voice), body_md: effective.body_md }
     })
   }
 
   ownProfile(platform = 'main') { return copy(this._own(platform)) }
+
+  enabled(platform) {
+    platformName(platform)
+    if(platform==='main')return true
+    const id=this.store.getDocument('settings')?.value.platform_document_ids?.[platform]??platform
+    return this.store.getDocument(id)?.value.persona_enabled!==false
+  }
 
   render(platform = 'main') {
     const profile = this.resolve(platform)
@@ -101,6 +106,26 @@ export class NativeProfileService {
       const version = this.store.putPersonaVersion({ profile_id: profile.id, version: (previous?.version || 0) + 1,
         ...pick(profile), reason, status: 'archived' })
       return { changed: true, profile: copy(profile), version: copy(version) }
+    })
+  }
+
+  setQQMainFollow(input, trustedContext) {
+    owner(trustedContext)
+    fields(input, new Set(['follow_main', 'expected_revision', 'expected_qq_revision']))
+    revision(input.expected_revision)
+    revision(input.expected_qq_revision)
+    if (typeof input.follow_main !== 'boolean') throw new Error('请选择是否使用主人设')
+    return this.store.transaction(() => {
+      const document = this.store.getDocument('qq')
+      if (!document) throw new Error('QQ 设置尚未初始化')
+      if (document.revision !== input.expected_qq_revision) throw new Error('QQ 设置版本冲突，请刷新后再保存')
+      const follow = this.save('qq', {
+        expected_revision: input.expected_revision,
+        reason: input.follow_main ? 'QQ 使用主人设' : 'QQ 使用独立人设',
+        follow_main: input.follow_main,
+        ...(input.follow_main ? { main_profile_id: this._own('main').id } : {}),
+      }, trustedContext)
+      return { profile: follow.profile, document, effective: this.resolve('qq'), changed: follow.changed }
     })
   }
 

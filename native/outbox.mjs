@@ -57,6 +57,7 @@ export class NativeOutbox {
   }
   _now() { const value = this.now(); if (!Number.isSafeInteger(value) || value < 0) throw new Error('动作时钟无效'); return value }
   get(id, { internal = false } = {}) { return project(this.store.db.prepare(SELECT + ' WHERE id=?').get(id), internal) }
+  getByIdempotencyKey(platform,key){return this.get(idOf(platform+'\0'+key))}
   list({ platform, status, limit = 100 } = {}) {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('动作数量无效')
     const conditions = [], args = []
@@ -76,7 +77,7 @@ export class NativeOutbox {
       source_type: 'native_action_service', recorded_at: at, metadata: { action_id: action.id, kind: action.kind,
         event_name: eventName, action_status: action.status, request_digest: action.request_digest, ...metadata } })
   }
-  prepare(input) {
+  prepare(input, { validateNew } = {}) {
     fields(input, ['platform','kind','target','body','idempotency_key','approval','source_evidence_id','not_before'])
     if (!['qq','tieba','bilibili'].includes(input.platform) || typeof input.kind !== 'string' || !/^[a-z][a-z0-9_.:-]{0,99}$/.test(input.kind)) throw new Error('动作平台或类型无效')
     if (typeof input.body !== 'string' || input.body.length > 200000 || Buffer.from(input.body, 'utf8').toString('utf8') !== input.body
@@ -92,6 +93,7 @@ export class NativeOutbox {
         if (previous.request_digest !== requestDigest) throw new Error('相同动作标识对应不同正文或目标，原记录保留')
         return { action: this.get(id), duplicate: true }
       }
+      if (validateNew) validateNew()
       const at = this._now(), authorized = input.approval === 'authorized', authorization = authorized ? randomUUID() : ''
       this.store.db.prepare(`INSERT INTO actions(id,platform,kind,target_json,body,body_digest,request_digest,approval_token,status,
         source_evidence_id,created_at,updated_at,not_before,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)

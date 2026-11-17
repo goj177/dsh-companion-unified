@@ -5,14 +5,15 @@ import {TiebaError,tiebaId,pbFields,pbInt,pbBytes,pbString,encodeSubRequest,enco
 import {parseTiebaReadText} from './tieba-content.mjs'
 import {redactText} from './memory-rules.mjs'
 import {publicSourceContext,explicitSourceReplyUid} from './source-context.mjs'
-import {tiebaReplyPaused} from './tieba-target.mjs'
+import {tiebaBarRepliesIgnored,tiebaReplyPaused,tiebaThreadReplyPaused} from './tieba-target.mjs'
 import {packTiebaIncomingImageContext} from './tieba-vision.mjs'
-import {lowInformationTiebaReply,tiebaContextRecord,publicTiebaPeerContext} from './tieba-incoming.mjs'
+import {lowInformationTiebaReply,tiebaContextRecord,tiebaMentionLabels,publicTiebaPeerContext,verifiedTiebaSelfRecipient} from './tieba-incoming.mjs'
 
 const hash=value=>createHash('sha256').update(value).digest('hex')
 const str=bytes=>{try{return new TextDecoder('utf-8',{fatal:true}).decode(bytes)}catch{throw new TiebaError('回复通知文字编码无法核验','invalid_response')}}
 const fields=bytes=>{const rows=pbFields(bytes);return {rows,int:n=>rows.find(x=>x.field===n)?.value??0n,text:n=>{const b=rows.find(x=>x.field===n)?.bytes;return b?str(b):''},bytes:n=>rows.find(x=>x.field===n)?.bytes}}
 const safe=(value,max=16000)=>redactText(String(value??'').slice(0,max))
+const uid=value=>typeof value==='string'&&/^[1-9]\d*$/.test(value)?value:''
 const user=bytes=>{const x=fields(bytes??Buffer.alloc(0));return {uid:x.int(2).toString(),name:safe(x.text(4)||x.text(3),240)}}
 export function encodeReplyNotifications({page=1,bduss=''}){return pbBytes(1,Buffer.concat([pbInt(1,page),pbBytes(3,Buffer.concat([pbInt(1,2),pbString(2,'22.12.1.0'),pbString(10,bduss)]))]))}
 export function parseReplyNotifications(bytes){
@@ -59,21 +60,41 @@ export class NativeTiebaReplies{
     if(!found||!found.author_uid||!row.is_sub_reply&&found.author_uid!==row.actor.uid)throw new TiebaError('原楼层已不可定位，不改发新楼','target_not_resolved')
     s._rememberLocations('post',row.thread_id,[found],'post_id',page.page.current_page)
     current??=found
-    const mentions=current.mention_uids??[],reply_to_uid=explicitSourceReplyUid(current)||(/^[1-9]\d*$/.test(row.quote_author?.uid??'')?row.quote_author.uid:'')||(row.is_sub_reply?found.author_uid:''),parent_author_uid=row.is_sub_reply?found.author_uid:'',knownTopic=page.posts.find(post=>post.floor===1)
-    let topic_author_uid=knownTopic?.author_uid??''
-    if(!row.is_sub_reply&&self_uid&&reply_to_uid!==self_uid&&!mentions.includes(self_uid)&&!topic_author_uid){const first=await s._postPage(row.thread_id,1,cred);topic_author_uid=first.posts.find(post=>post.floor===1)?.author_uid??''}
-    const text=safe(current.text)||row.text,source_context=publicSourceContext({platform:'tieba',source_kind:row.is_sub_reply?'comment_reply':'topic_comment',self_uid,topic_author_uid,author_uid:row.actor.uid,parent_author_uid,reply_to_uid,mentioned_uids:mentions,text}),records=[]
-    for(const candidate of [found,...children.filter(item=>item.post_id===row.quote_post_id&&item.author_uid===row.quote_author?.uid)]){
-      if(candidate.post_id===row.reply_id||records.some(item=>item.source_id===candidate.post_id))continue
-      const record=tiebaContextRecord(candidate,{self_uid,topic_author_uid});if(record)records.push(record)
+    const mentions=(current.mention_uids??[]).map(uid).filter(Boolean),explicitRecipient=explicitSourceReplyUid(current),parent_author_uid=row.is_sub_reply?found.author_uid:'',quoteId=uid(row.quote_post_id),quoteUid=uid(row.quote_author?.uid),selfMention=!!self_uid&&mentions.includes(self_uid)
+    let topic=page.posts.find(post=>post.floor===1)
+    if(!row.is_sub_reply&&self_uid&&!explicitRecipient&&!selfMention&&!topic)topic=(await s._postPage(row.thread_id,1,cred)).posts.find(post=>post.floor===1)
+    const topic_author_uid=topic?.author_uid??'',text=safe(current.text)||row.text,records=[],currentAt=current.source_at??0,currentId=BigInt(row.reply_id)
+    const earlier=(at,id)=>Number.isSafeInteger(at)&&at>0&&Number.isSafeInteger(currentAt)&&currentAt>0&&/^[1-9]\d*$/.test(id??'')&&(at<currentAt||at===currentAt&&BigInt(id)<currentId)
+    const contextRecord=(candidate,max_chars=360)=>{
+      const record=tiebaContextRecord(candidate,{self_uid,topic_author_uid,max_chars});if(!record||record.author_uid!==self_uid||record.reply_to_uid)return record
+      const reply_to_uid=verifiedTiebaSelfRecipient(this.store,{source_id:record.source_id,self_uid,thread_id:row.thread_id,parent_post_id:target.post_id})
+      return reply_to_uid?{...record,reply_to_uid,recipient_verification:'confirmed_local_receipt'}:record
     }
-    if(/^[1-9]\d*$/.test(self_uid??'')&&row.quote_author?.uid===self_uid&&/^[1-9]\d*$/.test(row.quote_post_id??'')&&!records.some(item=>item.source_id===row.quote_post_id)){
-      const prior=this.store.db.prepare("SELECT body,body_digest,target_json,receipt_json FROM actions WHERE platform='tieba' AND kind='tieba.reply' AND status='confirmed' AND json_extract(receipt_json,'$.server_id')=? ORDER BY confirmed_at DESC LIMIT 1").get(row.quote_post_id),receipt=prior?JSON.parse(prior.receipt_json):null
-      if(prior&&receipt.source==='server_receipt'&&receipt.accepted===true&&receipt.readback?.author_uid===self_uid&&JSON.parse(prior.target_json).thread_id===row.thread_id&&hash(prior.body)===prior.body_digest){const record=tiebaContextRecord({post_id:row.quote_post_id,author_uid:self_uid,text:prior.body},{self_uid,topic_author_uid,verification:'confirmed_local_receipt'});if(record)records.push(record)}
+    // The parent or topic can be useful context but does not establish who
+    // the speaker is addressing. Verify an independent quote against an
+    // earlier message with the exact same author UID and server coordinate.
+    const container=row.is_sub_reply?found:topic,containerRecord=contextRecord(container)
+    if(containerRecord&&containerRecord.source_id!==row.reply_id&&(!Number.isSafeInteger(container.source_at)||container.source_at<=0||earlier(container.source_at,container.post_id)))records.push(containerRecord)
+    const matchesQuote=item=>quoteId&&quoteUid&&item?.post_id===quoteId&&item.author_uid===quoteUid&&earlier(item.source_at,item.post_id)&&(row.is_sub_reply?item.post_id!==target.post_id:item.floor!==1)
+    let quote=(row.is_sub_reply?children:page.posts).find(matchesQuote),quoteVerification='server_read'
+    if(!quote&&row.is_sub_reply&&self_uid&&quoteUid===self_uid&&quoteId&&quoteId!==target.post_id&&quoteId!==row.reply_id){
+      const prior=this.store.db.prepare("SELECT body,body_digest,target_json,receipt_json FROM actions WHERE platform='tieba' AND kind='tieba.reply' AND status='confirmed' AND json_extract(receipt_json,'$.server_id')=? LIMIT 2").all(quoteId),stored=prior.length===1?prior[0]:null,receipt=stored?JSON.parse(stored.receipt_json):null,read=receipt?.readback,location=stored?JSON.parse(stored.target_json):null
+      if(stored&&receipt.source==='server_receipt'&&receipt.accepted===true&&receipt.rejected!==true&&(receipt.code===undefined||receipt.code===0)&&read?.author_uid===self_uid&&read.post_id===quoteId&&read.thread_id===row.thread_id&&read.parent_post_id===target.post_id&&location.thread_id===row.thread_id&&location.post_id===target.post_id&&read.body_sha256===stored.body_digest&&hash(stored.body)===stored.body_digest&&earlier(read.source_at,quoteId)){quote={post_id:quoteId,author_uid:self_uid,text:stored.body,source_at:read.source_at};quoteVerification='confirmed_local_receipt'}
     }
+    const quoteRecord=contextRecord(quote)
+    if(quoteRecord)records.push({...quoteRecord,verification:quoteVerification})
+    const reply_to_uid=explicitRecipient||quote?.author_uid||'',recipient_verification=explicitRecipient?'explicit_reply_uid':quote?(row.is_sub_reply?'verified_sub_reply_quote':'verified_post_quote'):selfMention?'structured_mention_uid':'none'
+    const notification_relation=self_uid&&row.is_sub_reply&&parent_author_uid===self_uid?'own_parent':self_uid&&!row.is_sub_reply&&topic_author_uid===self_uid?'own_topic':'none'
+    const addressed=!!self_uid&&(reply_to_uid?reply_to_uid===self_uid:selfMention),thirdParty=!addressed&&!selfMention&&(!!reply_to_uid||mentions.length>0||(!row.is_sub_reply&&!!topic_author_uid&&topic_author_uid!==self_uid))
+    const source_context={...publicSourceContext({platform:'tieba',source_kind:row.is_sub_reply?'comment_reply':'topic_comment',self_uid,topic_author_uid,author_uid:row.actor.uid,parent_author_uid,reply_to_uid,mentioned_uids:mentions,text}),addressed_to_self:addressed,address_kind:addressed?'account_self':thirdParty?'third_party':'unknown',recipient_verification,notification_relation}
+    const mention_labels=tiebaMentionLabels(current,source_context.mentioned_uids,self_uid)
+    const seen=new Set([row.reply_id,...records.map(record=>record.source_id)])
+    const nearby=children.filter(item=>earlier(item.source_at,item.post_id))
+      .sort((a,b)=>a.source_at-b.source_at||(BigInt(a.post_id)<BigInt(b.post_id)?-1:BigInt(a.post_id)>BigInt(b.post_id)?1:0))
+      .filter(item=>{if(seen.has(item.post_id))return false;seen.add(item.post_id);return true}).slice(-4).map(item=>contextRecord(item,200)).filter(Boolean)
     const public_image_sources=s.imageSources?.(current,{thread_id:row.thread_id,...(row.is_sub_reply?{post_id:target.post_id}:{})})??[]
     if(public_image_sources.some(source=>source.source_message_id!==row.reply_id||source.author_uid!==row.actor.uid))throw new TiebaError('图片原楼ID或作者与已核验通知不一致','target_not_resolved')
-    return {target,text,source_context,speaker:{uid:row.actor.uid,name:row.actor.name,role:'counterpart'},quoted_context:{records:records.slice(0,2),authority:'quoted_public_source'},public_image_sources}
+    return {target,text,source_context,mention_labels,speaker:{uid:row.actor.uid,name:row.actor.name,role:'counterpart'},quoted_context:{records:records.slice(0,2),authority:'quoted_public_source'},nearby_context:{records:nearby,authority:'public_same_floor'},public_image_sources}
   }
   existing(row){return this.store.db.prepare("SELECT id,status FROM actions WHERE platform='tieba' AND kind='tieba.reply' AND status IN ('confirmed','queued','leased','submitting','submitted','unknown') AND json_extract(target_json,'$.thread_id')=? AND (json_extract(target_json,'$.sub_reply_id')=? OR (json_extract(target_json,'$.post_id')=? AND json_extract(target_json,'$.sub_reply_id') IS NULL)) LIMIT 1").get(row.thread_id,row.reply_id,row.reply_id)}
   async poll({force=false}={}){if(this.flight)return this.flight;const work=this._poll({force});this.flight=work;try{const result=await work;this.health={...result,checked_at:this.service._now()};return result}catch(error){this.health={polled:false,queued:0,unresolved:1,reason:typeof error.code==='string'?error.code:'check_failed',checked_at:this.service._now(),model_calls:0};throw error}finally{this.flight=null}}
@@ -95,7 +116,7 @@ export class NativeTiebaReplies{
     if(!seed)for(const row of [...rows.values()].sort((a,b)=>a.source_at-b.source_at||a.reply_id.localeCompare(b.reply_id))){
       s._assertRun?.()
       if(seen.has(row.reply_id)||row.source_at<state.value.watermark_at)continue
-      if(row.actor.uid===account.uid||this.existing(row)){seen.add(row.reply_id);already_handled++;continue}
+      if(tiebaBarRepliesIgnored(s._settings().config,row.bar)||row.actor.uid===account.uid||this.existing(row)){seen.add(row.reply_id);already_handled++;continue}
       observed++
       try{
         if(lowInformationTiebaReply(row)){
@@ -105,17 +126,22 @@ export class NativeTiebaReplies{
             seen.add(row.reply_id);filtered_low_information++;continue
           }
         }
-        const {target,source_context,public_image_sources,speaker,quoted_context,text= row.text}=await this.resolve(row,cred,{self_uid:account.uid}),conversation_id='thread:'+row.thread_id+':'+target.post_id
+        const {target,source_context,mention_labels,public_image_sources,speaker,quoted_context,nearby_context,text= row.text}=await this.resolve(row,cred,{self_uid:account.uid}),conversation_id='thread:'+row.thread_id+':'+target.post_id
         s._assertRun?.()
-        if(tiebaReplyPaused(s._settings().config,row.actor.uid,s._now(),row.source_at)||s.participation?.paused({platform:'tieba',actor_uid:row.actor.uid,conversation_id:'thread:'+row.thread_id+':'+target.post_id,source_at:row.source_at,source_message_id:row.reply_id})){seen.add(row.reply_id);already_handled++;continue}
-        if(!source_context.addressed_to_self){if(source_context.address_kind==='third_party'){seen.add(row.reply_id);already_handled++;continue}throw new TiebaError('通知未确认是回复当前账号或提及当前UID，保留为第三方上下文','target_not_resolved')}
+        if(tiebaBarRepliesIgnored(s._settings().config,target.bar)){seen.add(row.reply_id);already_handled++;continue}
+        if(tiebaThreadReplyPaused(s._settings().config,row.thread_id,s._now(),row.source_at,{unknown_source_blocks:true})||tiebaReplyPaused(s._settings().config,row.actor.uid,s._now(),row.source_at)||s.participation?.paused({platform:'tieba',actor_uid:row.actor.uid,conversation_id:'thread:'+row.thread_id+':'+target.post_id,source_at:row.source_at,source_message_id:row.reply_id})){seen.add(row.reply_id);already_handled++;continue}
+        if(!source_context.addressed_to_self&&(source_context.address_kind==='third_party'||!source_context.mentioned_self&&!['own_parent','own_topic'].includes(source_context.notification_relation))){seen.add(row.reply_id);already_handled++;continue}
         s._rememberForum?.(row.thread_id,row.bar)
         let evidence
         if(s.memoryRuntime?.ingestHumanMessage)evidence=await s.memoryRuntime.ingestHumanMessage({platform:'tieba',conversation_id,actor_uid:row.actor.uid,display_name:row.actor.name,text,source_message_id:'reply:'+row.reply_id,source_at:row.source_at,visibility:'public'})
         else{const prior=this.store.getPlatformIdentity('tieba',row.actor.uid),identity=this.store.upsertPlatformIdentity({namespace:'tieba',platform_uid:row.actor.uid,...(prior?{entity_id:prior.entity_id,role:prior.role}:{role:'person'}),display_name:row.actor.name});evidence=this.memory.recordEvidence({platform:'tieba',conversation_id,actor_uid:row.actor.uid,actor_entity_id:identity.entity_id,direction:'in',kind:'message',text,source_message_id:'reply:'+row.reply_id,source_at:row.source_at,source_type:'user',visibility:'public',source:{kind:'user',explicit:false,pipeline:'native-tieba-replies'}})}
         s._assertRun?.()
         const peer_context=publicTiebaPeerContext(this.store,{actor_uid:row.actor.uid,self_uid:account.uid,conversation_id,exclude_evidence_id:evidence.id})
-        const delivery=s.activity.enqueueIncoming({platform:'tieba',kind:'incoming',trigger:force?'manual':'incoming',human:true,heavy:false,idempotency_key:'tieba:replies:'+this.accountKey()+':'+row.reply_id,source_evidence_id:evidence.id,target:{...target,channel:'comment',conversation_id,actor_uid:row.actor.uid,source_message_id:row.reply_id},body:text},{public_context:packTiebaIncomingImageContext({source_context,...(speaker?{speaker}:{}),...(quoted_context?{quoted_context}:{}),...(peer_context?{peer_context}:{})},public_image_sources)})
+        const publicContext={source_context,...(mention_labels?.length?{mention_labels}:{}),...(speaker?{speaker}:{}),...(quoted_context?{quoted_context}:{}),...(nearby_context?.records.length?{nearby_context}:{}),...(peer_context?{peer_context}:{})}
+        while(nearby_context?.records.length&&JSON.stringify(publicContext).length>3900)nearby_context.records.shift()
+        let packed=packTiebaIncomingImageContext(publicContext,public_image_sources)
+        while(nearby_context?.records.length&&JSON.parse(packed).public_images_omitted){nearby_context.records.shift();packed=packTiebaIncomingImageContext(publicContext,public_image_sources)}
+        const delivery=s.activity.enqueueIncoming({platform:'tieba',kind:'incoming',trigger:'incoming',human:true,heavy:false,idempotency_key:'tieba:replies:'+this.accountKey()+':'+row.reply_id,source_evidence_id:evidence.id,target:{...target,channel:'comment',conversation_id,actor_uid:row.actor.uid,source_message_id:row.reply_id},body:text},{public_context:packed})
         s._assertRun?.()
         if(!delivery.duplicate)queued++;seen.add(row.reply_id)
       }catch(error){s._assertRun?.();errors.push({reply_id:row.reply_id,code:typeof error.code==='string'?error.code:'queue_failed'});if(['verification_required','risk_pause','authentication_required','account_changed'].includes(error.code))break}

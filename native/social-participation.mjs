@@ -11,6 +11,25 @@ const messageId=value=>typeof value==='string'&&/^(?:reply:)?[1-9][0-9]{0,39}$/.
 const compact=value=>value.replace(/[\u0000-\u001f\u007f]/g,' ').replace(/\s+/g,' ').trim()
 const json=value=>JSON.parse(value)
 const fields=(value,allowed)=>{if(!isPlainObject(value)||Object.keys(value).some(key=>!allowed.includes(key)))throw Error('接话决定包含未定义字段')}
+export const TIEBA_ADDRESSEES=Object.freeze(['self','other','general','unclear'])
+export const TIEBA_ADDRESSEE_GUIDE='先结合原文、父楼、引用和同楼前后文判断这句话实际在跟谁说：addressee=self/other/general/unclear（本人/他人/泛讨论/不明）。提到AI、在自己的楼里或被通知，都不等于在跟你说；在谈其他人时选择skip，不把评论当成对你的攻击。只有确实在与你对话且值得接时选reply。没有已核验的收件UID时，reply还需填context_source_id，引用本次线索中你自己那条被接续的已核验发言。'
+const recipientProof=new Set(['explicit_reply_uid','verified_sub_reply_quote','verified_post_quote','structured_mention_uid'])
+function checkReplyAddressee(input,meta,scope,source_message_id){
+  let envelope;try{envelope=json(meta.public_context)}catch{}
+  const source=envelope?.source_context
+  if(source?.address_kind==='third_party')throw Error('原来信的收件对象是其他人，不能自动回复')
+  if(source?.address_kind==='account_self'&&recipientProof.has(source.recipient_verification)&&(source.reply_to_uid===scope.account_uid||source.mentioned_self===true&&source.mentioned_uids?.includes(scope.account_uid)))return
+  const records=[...(envelope?.quoted_context?.records??[]),...(envelope?.nearby_context?.records??[])]
+  if(!input.context_source_id||input.context_source_id===source_message_id||!records.some(row=>row.source_id===input.context_source_id&&row.author_uid===scope.account_uid&&['server_read','confirmed_local_receipt'].includes(row.verification)&&typeof row.text==='string'&&row.text.trim()))throw Error('仅收到楼层通知，回复需引用本次线索中一条与你实际接续的已核验发言；指向不明请选择skip')
+}
+
+/** A reply grant belongs to a single source and run, never the whole floor. */
+export function hasContextualTiebaReplyDecision(store,{incoming_task_id,task_id,source_evidence_id,session_id}={}){
+  if(!incoming_task_id||!task_id||!source_evidence_id)return false
+  const where=" FROM journal_events WHERE source_type=? AND json_extract(metadata_json,'$.incoming_task_id')=? AND json_extract(metadata_json,'$.source_evidence_id')=?"
+  if(store.db.prepare('SELECT 1'+where+" AND json_extract(metadata_json,'$.action') IN ('skip','pause') LIMIT 1").get(SOURCE,incoming_task_id,source_evidence_id))return false
+  return !!store.db.prepare('SELECT 1'+where+" AND json_extract(metadata_json,'$.action')='reply' AND json_extract(metadata_json,'$.addressee')='self' AND json_extract(metadata_json,'$.task_id')=?"+(session_id===undefined?'':" AND json_extract(metadata_json,'$.session_id')=?")+' LIMIT 1').get(SOURCE,incoming_task_id,source_evidence_id,task_id,...(session_id===undefined?[]:[session_id]))
+}
 
 /** A model may decline its current, actually leased public incoming message.
  * It cannot grant permissions, alter a persona, or address another platform.
@@ -48,7 +67,7 @@ export class NativeSocialParticipation{
     const evidence=this.store.db.prepare('SELECT id,platform,actor_uid,conversation_id,direction,source_type,visibility,status,source_json,source_message_id,source_at,recorded_at,CAST(text AS BLOB) text_bytes FROM evidence WHERE id=?').get(task.source_evidence_id),source=evidence?json(evidence.source_json):null
     const source_message_id=messageId(evidence?.source_message_id)
     if(!evidence||evidence.platform!==scope.platform||evidence.actor_uid!==scope.actor_uid||evidence.conversation_id!==scope.conversation_id||evidence.direction!=='in'||evidence.source_type!=='user'||evidence.visibility!=='public'||!['confirmed','pending','uncertain'].includes(evidence.status)||!['user','human','user_statement'].includes(source.kind)||!source_message_id||target.actor_uid!==scope.actor_uid||target.conversation_id!==scope.conversation_id||messageId(target.source_message_id)!==source_message_id||!Buffer.from(evidence.text_bytes).equals(Buffer.from(task.body_bytes)))throw Error('接话决定与实际来者、会话或原始来信不符')
-    return {scope,task,evidence,source_message_id,at}
+    return {scope,task,meta,evidence,source_message_id,at}
   }
   /** Read-only prequeue and presend gate. Manual bypass is only for self choice;
    * an owner's explicit pause/cutoff always remains in force. */
@@ -74,23 +93,30 @@ export class NativeSocialParticipation{
   }
   paused(input={}){return this.check(input).paused}
   decide(input={},trusted_context={}){
-    fields(input,['action','reason','pause_minutes','actor_uid'])
-    if(!['skip','pause','resume'].includes(input.action)||typeof input.reason!=='string'||!input.reason.isWellFormed()||!compact(input.reason)||input.reason.length>240)throw Error('接话决定需要skip/pause/resume和简短具体理由')
+    fields(input,['action','reason','pause_minutes','actor_uid','addressee','context_source_id'])
+    if(!['reply','skip','pause','resume'].includes(input.action)||typeof input.reason!=='string'||!input.reason.isWellFormed()||!compact(input.reason)||input.reason.length>240)throw Error('接话决定需要reply/skip/pause/resume和简短具体理由')
     if(input.pause_minutes!==undefined&&input.action!=='pause')throw Error('仅pause可设置暂停分钟数')
+    if(input.addressee!==undefined&&!TIEBA_ADDRESSEES.includes(input.addressee))throw Error('谈话对象只能为self/other/general/unclear')
+    if(input.context_source_id!==undefined&&!numeric(input.context_source_id))throw Error('上下文来源须为本次线索中的有效source_id')
+    if(input.action==='reply'&&!input.addressee)throw Error('先结合上下文判断实际谈话对象，reply必须填写addressee')
+    const action=input.action==='reply'&&input.addressee!=='self'?'skip':input.action,addressee=input.addressee??null,context_source_id=input.context_source_id??null
     const minutes=input.action==='pause'?input.pause_minutes??30:0
     if(!Number.isSafeInteger(minutes)||minutes<0||input.action==='pause'&&minutes<1||minutes>1440)throw Error('暂停时间须为1至1440分钟整数')
     this.store._write()
     return this.store.transaction(()=>{
-      const {scope,task,evidence,source_message_id,at}=this._trusted(trusted_context,input.actor_uid),reason=compact(input.reason),key=this._key(scope,source_message_id),old=this._event(key)
-      if(old){if(old.action!==input.action||old.reason!==reason||old.pause_minutes!==minutes)throw Error('同一来信已有不同接话决定，保留原决定');return {ok:true,duplicate:true,action:old.action,until:old.until,skip_before:old.skip_before,journal_id:old.id,model_calls:0}}
+      const {scope,task,meta,evidence,source_message_id,at}=this._trusted(trusted_context,input.actor_uid),reason=compact(input.reason),sourceKey=this._key(scope,source_message_id),key=action==='reply'?sourceKey+':reply:'+hash(JSON.stringify([trusted_context.task_id,trusted_context.session_id])):sourceKey,old=this._event(key)
+      if(action==='reply'&&this._event(sourceKey))throw Error('这条来信已决定跳过或暂停，不能改成回复')
+      if(old){if(old.action!==action||old.reason!==reason||old.pause_minutes!==minutes||(old.addressee??null)!==addressee||(old.context_source_id??null)!==context_source_id)throw Error('同一来信已有不同接话决定，保留原决定');return {ok:true,duplicate:true,action:old.action,until:old.until,skip_before:old.skip_before,journal_id:old.id,model_calls:0}}
       const state=this._state(scope),owner=tiebaReplyPaused(this._settings().tieba??{},scope.actor_uid,at,evidence.source_at)
-      if(owner&&input.action==='resume')throw Error('模型不能恢复主人暂停的回复对象')
+      if(owner&&action==='resume')throw Error('模型不能恢复主人暂停的回复对象')
+      if(action==='reply'&&(owner||state?.until>at||state?.skip_before&&evidence.source_at<state.skip_before))throw Error('当前来信已暂停接话，不能决定回复')
+      if(action==='reply')checkReplyAddressee(input,meta,scope,source_message_id)
       let until=state?.until??0,skip_before=state?.skip_before??0,prior_skip_before=state?.prior_skip_before??0
       if(input.action==='pause'){prior_skip_before=state?.until>at?state.prior_skip_before??0:skip_before;until=Math.max(until,at+minutes*60000);skip_before=Math.max(skip_before,until)}
       if(input.action==='resume'){skip_before=until>at?Math.max(prior_skip_before,at):skip_before;until=0;prior_skip_before=skip_before}
-      const metadata={subtype:SUBTYPE,schema_version:1,...scope,action:input.action,reason,pause_minutes:minutes,until,skip_before,prior_skip_before,source_message_id,source_evidence_id:evidence.id,incoming_task_id:task.id,task_id:trusted_context.task_id,session_id:trusted_context.session_id,decided_at:at,authority:'trusted_native_backend_only',emotion_inferred:false,model_calls:0,persona_unchanged:true,permissions_unchanged:true,no_publication:true}
+      const metadata={subtype:SUBTYPE,schema_version:1,...scope,action,reason,...(addressee?{addressee}:{}),...(context_source_id?{context_source_id}:{}),pause_minutes:minutes,until,skip_before,prior_skip_before,source_message_id,source_evidence_id:evidence.id,incoming_task_id:task.id,task_id:trusted_context.task_id,session_id:trusted_context.session_id,decided_at:at,authority:'trusted_native_backend_only',emotion_inferred:false,model_calls:0,persona_unchanged:true,permissions_unchanged:true,no_publication:true}
       const event=this.store.appendJournalEvent({id:'journal:'+hash(key),event_key:key,event_type:'log',platform:'tieba',actor_uid:scope.actor_uid,conversation_id:scope.conversation_id,direction:'internal',status:'recorded',visibility:'owner',text:'',source_at:at,recorded_at:at,source_type:SOURCE,metadata})
-      return {ok:true,duplicate:false,action:input.action,until,skip_before,journal_id:event.id,model_calls:0}
+      return {ok:true,duplicate:false,action,until,skip_before,journal_id:event.id,model_calls:0}
     })
   }
   /** Small factual context only. Incoming text is already in the task body;
@@ -106,7 +132,7 @@ export class NativeSocialParticipation{
     if(incoming||confirmed)parts.push('本楼近24小时可核对的此前来信'+incoming+'条、已确认回应'+confirmed+'条。')
     if(state?.action==='pause')parts.push(state.until>at?'此前自己选择暂缓接话，剩余约'+Math.ceil((state.until-at)/60000)+'分钟。':'此前自选暂停已到期；暂停截止前旧来信不补回。')
     if(state?.action==='resume')parts.push('此前已自行恢复接话；旧来信截止线保留。')
-    if(parts.length)parts.push('是否接话由当前内容决定；正常回复可直接发表，想结束时才用接话决定。')
+    if(parts.length)parts.push('是否接话由当前有效人设和来信内容决定。')
     return parts.join('').slice(0,220)
   }
 }

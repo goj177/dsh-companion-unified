@@ -9,6 +9,19 @@ const identifier=x=>typeof x==='string'&&/^[1-9]\d{0,30}$/.test(x)?x:''
 const names={tieba:'贴吧',bilibili:'B站',qq:'QQ',harness:'本机',system:'系统'}
 const placeholders=n=>Array(n).fill('?').join(',')
 const isComment=a=>['tieba.reply','bilibili.comment','bilibili.reply'].includes(a.kind)
+function activitySource(row, evidence) {
+ if(row.kind!=='activity.incoming'||row.meta.execution!=='model'||!evidence||row.platform!==evidence.platform)return null
+ const target=row.target,thread=identifier(target.thread_id)
+ const destination=target.channel==='dm'?'私信':target.channel==='live'?'直播间留言':target.channel==='comment'?'评论':target.channel==='mention'?'提及':'来信'
+ let url=''
+ if(target.channel!=='dm'&&row.platform==='tieba'&&thread)url='https://tieba.baidu.com/p/'+thread
+ if(row.platform==='bilibili'&&['comment','mention'].includes(target.channel)){
+  const object=identifier(target.object_id)
+  if(object&&String(target.object_type)==='1')url='https://www.bilibili.com/video/av'+object
+ }
+ const text=clean(evidence.text,320)
+ return {id:evidence.id,destination,url,text,truncated:(evidence.text?.length??0)>320}
+}
 function actionReport(row){
  const target=parse(row.target_json),receipt=parse(row.receipt_json),meta=parse(row.metadata_json),body=clean(row.body),id=identifier(receipt.server_id),tid=identifier(target.thread_id??receipt.thread_id??receipt.readback?.thread_id),parent=identifier(target.post_id),floor=receipt.readback?.floor
  let label=({'tieba.message':'回复私信','tieba.post':'发布主题','tieba.reply':parent?'回复楼中楼':'普通回帖','tieba.sign':'签到','tieba.follow':'关注','bilibili.dynamic':'发布动态','bilibili.comment':'发表评论','bilibili.reply':'回复评论','bilibili.like':'点赞','bilibili.coin':'投币','bilibili.share':'分享内容','qq.send':'发送消息','qq.mute':'禁言成员','qq.unmute':'解除禁言','qq.profile':'更新自身资料'})[row.kind]??'平台操作',destination='',url=''
@@ -51,6 +64,18 @@ export function ownerActivityReports(store,status,{limit=120}={}){
  const selected=[...(status.tasks??[])].sort((a,b)=>(b.updated_at??0)-(a.updated_at??0)).slice(0,Math.min(120,limit)),ids=selected.map(x=>x.id)
  if(!ids.length)return {...status,tasks:[],total_tasks:status.tasks?.length??0}
  const rows=store.db.prepare('SELECT id,platform,kind,status,target_json,CAST(body AS BLOB) AS raw_body,body_digest,metadata_json,created_at,updated_at,source_evidence_id FROM actions WHERE id IN ('+placeholders(ids.length)+')').all(...ids),byId=new Map(rows.map(r=>[r.id,{...r,body:Buffer.from(r.raw_body).toString('utf8'),meta:parse(r.metadata_json),target:parse(r.target_json)}])),batches=[...new Set(rows.map(r=>parse(r.metadata_json).batch_id).filter(Boolean))],linked=[...new Set(rows.filter(r=>parse(r.metadata_json).execution==='publication').map(r=>parse(r.target_json).action_id).filter(Boolean))]
+ const incomingIds=[...new Set([...byId.values()].filter(row=>row.kind==='activity.incoming'&&row.meta.execution==='model').map(row=>row.source_evidence_id).filter(Boolean))]
+ const incomingEvidence=incomingIds.length?store.db.prepare("SELECT id,platform,substr(text,1,641) text FROM evidence WHERE id IN ("+placeholders(incomingIds.length)+") AND direction='in' AND source_type='user' AND visibility<>'secret'").all(...incomingIds):[]
+ const evidenceById=new Map(incomingEvidence.map(evidence=>[evidence.id,evidence])),batchSources=new Map()
+ for(const task of selected){
+  const row=byId.get(task.id)
+  if(!row?.source_evidence_id)continue
+  const source=activitySource(row,evidenceById.get(row.source_evidence_id))
+  if(!source||!source.text&&!source.url)continue
+  const key=row.platform+'\0'+(row.meta.batch_id||row.id),group=batchSources.get(key)??[]
+  if(!group.some(item=>item.id===source.id))group.push(source)
+  batchSources.set(key,group)
+ }
  let actions=[]
  if(batches.length||linked.length){const clauses=[],args=[];if(batches.length){clauses.push("json_extract(metadata_json,'$.prepared_in.round_id') IN ("+placeholders(batches.length)+')');args.push(...batches)}if(linked.length){clauses.push('id IN ('+placeholders(linked.length)+')');args.push(...linked)}actions=store.db.prepare("SELECT id,platform,kind,status,target_json,CAST(body AS BLOB) raw_body,body_digest,receipt_json,metadata_json FROM actions WHERE kind NOT LIKE 'activity.%' AND ("+clauses.join(' OR ')+')').all(...args).map(r=>({...r,body:Buffer.from(r.raw_body).toString('utf8')}))}
  const events=batches.length?store.db.prepare("SELECT metadata_json,source_at,recorded_at FROM journal_events WHERE json_extract(metadata_json,'$.batch_id') IN ("+placeholders(batches.length)+") OR json_extract(metadata_json,'$.round_id') IN ("+placeholders(batches.length)+')').all(...batches,...batches).map(r=>({...r,meta:parse(r.metadata_json)})):[]
@@ -69,7 +94,10 @@ export function ownerActivityReports(store,status,{limit=120}={}){
   const planned=group.find(e=>e.meta.subtype==='browse_round_started')?.meta.limits?.read??row.target.round_limits?.read_per_round,read_target=Number.isSafeInteger(planned)&&planned>0?planned:null
   const stage=task.status==='queued'?(task.reason==='peak'?'等待谷时':'等待执行'):pending?'正在发表':uncertain||task.status==='unknown'?'结果待核对':task.status==='completed'?'已完成':task.status==='blocked'?'受限':task.status==='running'||task.status==='leased'?(task.kind==='activity.explore'&&read_target!==null&&reads.size<read_target?'正在浏览':'正在处理'):'等待处理'
   const progress={stage,read_target,read_current:readKnown?reads.size:['queued','leased','running'].includes(task.status)?0:null,confirmed_actions:confirmed,pending_actions:pending}
-  return {...task,report:{title,progress,summary:summary.join('；'),reads:readKnown?reads.size:null,read_attempts:attempts.size,confirmed_actions:confirmed,confirmed_comments:comments.filter(a=>a.status==='confirmed').length,pending_actions:pending,unknown_actions:uncertain,actions:reports,actions_total:related.length,notes,finish_note:protectedTail?(/输出.*长度上限/.test(task.reason)?'单次输出达到长度限制。':/步骤上限/.test(task.reason)?'达到本轮步骤限制。':'达到单轮Token保护。')+'已停止追加思考；已确认的发表结果保留，不重跑。':task.status==='unknown'?'本轮没有正常结束；只有标为“已确认”的内容才能算已完成。':'',historical_detail_missing:!related.length&&!attempts.size&&!direct.length,model_tokens:row.meta.actual_tokens??null,model_usage_known:row.meta.usage_known===true}}
+  const sources=task.kind==='activity.incoming'&&row.meta.execution==='model'?(batchSources.get(row.platform+'\0'+(batch||row.id))??[]):[]
+  const finishedAt=Number.isSafeInteger(row.meta.completed_at)?row.meta.completed_at:null
+  return {...task,report:{title,progress,summary:summary.join('；'),reads:readKnown?reads.size:null,read_attempts:attempts.size,confirmed_actions:confirmed,confirmed_comments:comments.filter(a=>a.status==='confirmed').length,pending_actions:pending,unknown_actions:uncertain,actions:reports,actions_total:related.length,notes,finish_note:protectedTail?(/输出.*长度上限/.test(task.reason)?'单次输出达到长度限制。':/步骤上限/.test(task.reason)?'达到本轮步骤限制。':'达到单轮Token保护。')+'已停止追加思考；已确认的发表结果保留，不重跑。':task.status==='unknown'?'本轮没有正常结束；只有标为“已确认”的内容才能算已完成。':'',historical_detail_missing:!related.length&&!attempts.size&&!direct.length,model_tokens:row.meta.actual_tokens??null,model_usage_known:row.meta.usage_known===true,
+   sources:sources.slice(0,3),sources_total:sources.length,started_at:start,finished_at:finishedAt,reason_detail:clean(row.meta.last_error,320)}}
  })
  return {...status,tasks,total_tasks:status.tasks?.length??0,details_scope:'local_owner_only'}
 }

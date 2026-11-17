@@ -6,7 +6,7 @@ const imageTypes=new Set(['image/png','image/jpeg','image/gif','image/webp'])
 /** Publication ACL only. The caller must obtain this asset from NativeAssets
  * so its bytes/hash/type have already been verified; this never reads files. */
 export function canPublishAsset(asset,{platform,bar}={}){
-  if(!['bilibili','tieba'].includes(platform)||!isPlainObject(asset)||!imageTypes.has(asset.media_type)||!isPlainObject(asset.manifest))return false
+  if(!['bilibili','qq','tieba'].includes(platform)||!isPlainObject(asset)||!imageTypes.has(asset.media_type)||!isPlainObject(asset.manifest))return false
   if(bar!==undefined&&(typeof bar!=='string'||!bar.isWellFormed()||/[\0\r\n]/.test(bar)))return false
   const manifest=asset.manifest,registrations=Array.isArray(manifest.registrations)?manifest.registrations.filter(isPlainObject):[]
   const manifests=[manifest,...registrations.map(row=>row.manifest).filter(isPlainObject)],entries=[]

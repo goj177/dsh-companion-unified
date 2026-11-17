@@ -2,6 +2,7 @@
 import {createHash,randomUUID} from 'node:crypto'
 import {NativeStore} from './store.mjs'
 import {NativeAssets} from './assets.mjs'
+import {NativeExpressionLibrary} from './expression-library.mjs'
 import {NativeSecrets} from './secrets.mjs'
 import {NativeResources} from './resources.mjs'
 import {NativeImageDescription} from './image-description.mjs'
@@ -34,6 +35,7 @@ import {NativeTiebaDiagnostics} from './tieba-diagnostics.mjs'
 import {NativeSocial,isQQModeration,normalizeQQModerationTarget,qqModerationAuthorized} from './social.mjs'
 import {NativeActivity} from './activity.mjs'
 import {NativeScheduledRounds} from './scheduled-rounds.mjs'
+import {NativeSchoolSchedule} from './school-schedule.mjs'
 import {NativeMoneyBudget} from './money-budget.mjs'
 import {effectiveActivityPolicy,restoreExpiredBudgetOverrides} from './budget-override.mjs'
 import {NativeDiary} from './diary.mjs'
@@ -62,7 +64,7 @@ class NativeCore{
     fields(options,['store','resources','runtime_root','resource_tools','now','sdk','audit_only','workspace_ids','operator_authorizer','asset_management_authorizer','qq_connection_factory','media_downloader','qr_render','websocket_factory','fetcher','schedule','connection'])
     if(!(options.store instanceof NativeStore))throw new Error('必须先显式打开原生数据库；旧目录资料需要先迁移，不能运行时fallback')
     for(const key of callbackNames)if(options[key]!==undefined&&typeof options[key]!=='function')throw new Error(key+'必须为可信宿主函数')
-    this.ctx=ctx;this.store=options.store;this.options=options;this.now=options.now??this.store.now;this.started=false;this.closed=false;this.audit_only=options.audit_only!==false;this.leader=false;this.timers=[];this.running=new Set();this.operatorTurns=new Map();this.activeTurns=new Set();this.workspacePaths=new Map();this.last_error='';this.collector={empty_rounds:0,failures:0,next_at:0,last:null,account_key:''};this.flights={};this.process_id=randomUUID();this.read_operations=NATIVE_READ_OPERATIONS
+    this.ctx=ctx;this.store=options.store;this.options=options;this.now=options.now??this.store.now;this.started=false;this.closed=false;this.audit_only=options.audit_only!==false;this.leader=false;this.timers=[];this.running=new Set();this.operatorTurns=new Map();this.activeTurns=new Set();this.last_error='';this.collector={empty_rounds:0,failures:0,next_at:0,last:null,account_key:''};this.flights={};this.process_id=randomUUID();this.read_operations=NATIVE_READ_OPERATIONS
     if(typeof this.now!=='function'||!this.store.getDocument('settings'))throw new Error('原生资料未初始化；请显式迁移或对空库调用initNativeDefaults')
     const resources=options.resources??new NativeResources({store:this.store,runtime_root:options.runtime_root,tools:options.resource_tools,now:this.now})
     if(resources.store!==this.store||typeof resources.workspace!=='function'||typeof resources.registerProcess!=='function')throw new Error('Core资源必须明确绑定同一NativeStore')
@@ -71,10 +73,12 @@ class NativeCore{
     const store=this.store,now=this.now,assets=new NativeAssets({store}),secrets=new NativeSecrets({store}),profiles=new NativeProfileService({store}),people=new NativePeople({store,now}),memory=new NativeMemoryRuntime({store,now,source_context:(sid,row)=>this._memorySourceContext(sid,row),current_qq_authority:(exec,context)=>this._currentQQAuthority(exec,context),current_input_source:input=>this._memoryActivityInput(input)}),references=new NativeReferences({store,profiles,now,memory_runtime:memory}),learning=new NativeLearning({store,now,references}),mood=new NativeMood({store,now}),hormone=new NativeHormone({store,now}),affect=new NativeAffectRuntime({store,hormone,mood,now,enabled:()=>!this.audit_only&&!this.closed}),speech=new NativeSpeech({store,now}),diary=new NativeDiary({store,now})
     let qq
     const session_names=new NativeSessionNames({store,ctx,now,enabled:()=>this.leader&&!this.audit_only&&!this.closed,resolve_group:id=>qq?.connection?.connected?qq._readCall('get_group_info',{group_id:id}):null})
-    const controller=createNativeSessionController(ctx,{resources,sdk:options.sdk,session_names,scope_tools:(agent,active)=>active?this.hooks?.scopeTools(agent):this.hooks?.releaseTools(agent),resolve_images:input=>this._qqInputImages(input),resolve_activity_images:input=>this._publicInputImages(input)})
+    const dshModel=()=>service(ctx,'agentDefaultModel')?.currentSelection()
+    this.dshModel=dshModel
+    const controller=createNativeSessionController(ctx,{resources,sdk:options.sdk,session_names,default_model:dshModel,scope_tools:(agent,active,content)=>active?this.hooks?.scopeTools(agent,content):this.hooks?.releaseTools(agent),resolve_images:input=>this._qqInputImages(input),resolve_activity_images:input=>this._publicInputImages(input)})
     let runner,social
     const money=new NativeMoneyBudget({store,now})
-    const activity=new NativeActivity({store,now,money_budget:money,model_gate:task=>this._incomingModelGate(task),background_model:batch=>!!this.services?.memory_consolidation.capability(batch)||this._maintenanceCapability(batch)?.kind==='people',runner:(batch,controls)=>this._runModel(batch,controls),publication_runner:(batch,controls)=>this.leader&&!this.audit_only&&!this.closed?social.publicationRunner(batch,controls):{status:'not_started',retry:true,reason:'当前实例没有渠道主租约'}})
+    const activity=new NativeActivity({store,now,money_budget:money,dsh_model:dshModel,model_gate:(task,cache)=>this._incomingModelGate(task,cache),background_model:batch=>!!this.services?.memory_consolidation.capability(batch)||this._maintenanceCapability(batch)?.kind==='people',runner:(batch,controls)=>this._runModel(batch,controls),publication_runner:(batch,controls)=>this.leader&&!this.audit_only&&!this.closed?social.publicationRunner(batch,controls):{status:'not_started',retry:true,reason:'当前实例没有渠道主租约'}})
     qq=new NativeQQ({store,session_controller:controller,memory_runtime:memory,assets,credentials:secrets.bind('qq'),now,connection_factory:options.qq_connection_factory,download:options.media_downloader,transcriber:resources.transcriber,card_renderer:resources.cardRenderer,logger:ctx.logger,money_budget:money,local_moderation_source:input=>this._localModerationSource(input)})
     if(typeof resources.qqBridgeCacheReader==='function')qq.media.bindBridgeCacheReader(resources.qqBridgeCacheReader)
     const bilibili=new NativeBilibili({store,credentials:secrets.bind('bilibili'),assets,memory_runtime:memory,activity,fetcher:options.fetcher,now,learning,resource_runner:resources.resourceRunner,qr_render:options.qr_render,self_names:()=>[profiles.resolve('bilibili').name],websocket_factory:options.websocket_factory})
@@ -88,18 +92,25 @@ class NativeCore{
     social.before_send=action=>{this.assertMutable();if(!this.leader)throw new Error('当前实例没有渠道主租约，网络发送尚未开始');return sharedSendGate(action)}
     const sign_scheduler=new NativeTiebaSignScheduler({store,social,tieba,now,enabled:()=>this.started&&this.leader&&!this.audit_only&&!this.closed})
     this.workspace_ids={...NATIVE_WORKSPACE_IDS,...options.workspace_ids}
+    this.homeWorkspacePath=resources.workspace(this.workspace_ids.main)
     runner=new NativeSessionRunner({store,controller,qq,money_budget:money,workspace_ids:this.workspace_ids,now,context_resolver:(batch,base)=>this._runnerContext(batch,base),memory_sources:(batch,context)=>this._maintenanceSources(batch,context),maintenance_binding:batch=>this._maintenanceBinding(batch)})
-    const image_description=new NativeImageDescription({store,llm:service(ctx,'llm'),attachments:service(ctx,'attachments'),selected:()=>service(ctx,'agentDefaultModel')?.currentSelection(),stream:(session_id,request,next)=>runner.auxiliaryStream(session_id,request,next),now})
+    const image_description=new NativeImageDescription({store,llm:service(ctx,'llm'),
+      selected:sessionId=>(controller.get(sessionId)??service(ctx,'agents')?.get?.(sessionId))?.model?.current?.()??dshModel()})
+    const school=new NativeSchoolSchedule({store,runtime_root:resources.runtime,schedule:()=>service(ctx,'schedule'),
+      enabled:()=>this.started&&this.leader&&!this.audit_only&&!this.closed,now,
+      dsh_model:dshModel,llm:service(ctx,'llm'),profile_name:()=>profiles.ownProfile('main').name})
     const learning_loop=new NativeLearningLoop({store,now}),learning_runtime=new NativeLearningRuntime({store,loop:learning_loop,legacy:learning,memory,now,enabled:()=>!this.audit_only&&!this.closed,resolve_context:exec=>this.context(exec),get_task:id=>runner.task(id)})
     this.expression_capability=Symbol('native-expression-background')
     const expression_evolution=new NativeExpressionEvolution({store,profiles,loop:learning_loop,now,background_capability:this.expression_capability})
+    const expression_library=new NativeExpressionLibrary({store,assets,now})
     const memory_consolidation=new NativeMemoryConsolidation({store,memory:memory.memory,activity,holder_id:this.holder_id,is_leader:()=>this.leader&&!this.audit_only&&!this.closed,is_idle:input=>this._memoryIdle(input),resolve_source:evidence=>resolveNativeMemorySource({store,evidence}),now})
     memory.attachLearningLoop(learning_loop)
     this.people_summary_capability=Symbol('native-people-summary')
     const people_summary=new NativePeopleSummary({store,people,profiles,activity,now,read_source:(input,context)=>readNativePeopleSource({store,people},input,context),issue_task:task=>this._issueMaintenance('people',task),background_capability:this.people_summary_capability})
     const portability=new NativePortable({store,assets,secrets,now,assert_quiescent:()=>resources.assertQuiescent()})
     const persona_export=new NativePersonaExport({store,profiles,now}),tieba_diagnostics=new NativeTiebaDiagnostics({now,getStatus:()=>tieba.status({refresh:false}),getPorts:()=>({sdk_hooks:!!this.hooks,native_tools:!!this.toolRegistration,agent_registry:['create','resume','get'].every(key=>typeof service(ctx,'agents')?.[key]==='function'),image_attachments:typeof service(ctx,'attachments')?.saveImages==='function',admin_routes:!!this.admin}),getSettings:()=>({...store.getDocument('tieba')?.value.tieba,enabled:store.getDocument('tieba')?.value.enabled}),getAssetCounts:()=>({images:tieba.images({limit:1}).available_count}),getLearningFlags:()=>({enabled:store.getDocument('learning')?.value.enabled===true,loop_enabled:learning_loop._config().enabled,bar_style_enabled:store.getDocument('tieba')?.value.tieba?.learning?.bar_style_enabled===true,persona_evolution_enabled:store.getDocument('tieba')?.value.tieba?.learning?.persona_evolution_enabled===true})})
-    this.services={people_summary,sign_scheduler,expression_evolution,persona_export,tieba_diagnostics,memory_consolidation,image_description,store,resources,assets,secrets,profiles,people,memory,memory_runtime:memory,memory_store:memory.memory,references,learning,learning_loop,learning_runtime,mood,hormone,affect,speech,diary,qq,bilibili,tieba,participation,tieba_atmosphere:tieba.atmosphere,social,activity,scheduled_rounds,money,session_names,session_controller:controller,session_runner:runner,portability}
+    this.services={people_summary,sign_scheduler,expression_evolution,expression_library,persona_export,tieba_diagnostics,memory_consolidation,image_description,store,resources,assets,secrets,profiles,people,memory,memory_runtime:memory,memory_store:memory.memory,references,learning,learning_loop,learning_runtime,mood,hormone,affect,speech,diary,qq,bilibili,tieba,participation,tieba_atmosphere:tieba.atmosphere,social,activity,scheduled_rounds,money,session_names,session_controller:controller,session_runner:runner,portability}
+    this.services.school=school
     session_names.attach()
     for(const platform of ['main','qq','bilibili','tieba'])if(!store.getPersonaProfile('persona-'+platform))this._warn('原生'+platform+'人设缺失，不用其他稿冒充')
     this._install()
@@ -153,11 +164,19 @@ class NativeCore{
   _warn(error){this.last_error=String(error?.message??error).slice(0,300);try{this.ctx.logger?.warn?.(this.last_error)}catch{}}
   _track(work,key){const promise=Promise.resolve(work);this.running.add(promise);if(key)this.flights[key]=promise;promise.catch(error=>this._warn(error)).finally(()=>{this.running.delete(promise);if(key&&this.flights[key]===promise)delete this.flights[key]});return promise}
   _ownerEntity(){const ids=new Set(this.store.listPlatformIdentities({role:'owner',limit:1000}).map(row=>row.entity_id)),explicit=this.store.getDocument('mood')?.value.owner_entity_id;if(explicit){const entity=this.store.getEntity(explicit);if(entity?.kind==='person'&&entity.metadata.owner_confirmed===true)ids.add(explicit)}return ids.size===1?[...ids][0]:null}
-  _workspacePlatform(exec){const sid=sidOf(exec),meta=this.services?.session_controller.metadata(sid);if(meta&&['main','qq','tieba','bilibili'].includes(meta.platform))return {platform:meta.platform,workspace_id:meta.workspace_id};const cwd=exec?.agent?.session?.header?.cwd,bound=this.workspacePaths.get(cwd);return bound??{platform:'main'}}
-  _personaPlatform(agent,context){const task=this.services?.session_runner.task(sidOf({agent}));if(task?.maintenance_kind==='people'&&this._maintenanceCapability(task.batch)?.kind==='people')return 'main';if(['qq','bilibili','tieba'].includes(context.platform))return context.platform;return this._workspacePlatform({agent}).platform}
-  _loadWorkspaces(){this.workspacePaths.clear();const bindings=this.store.listDocuments({type:'workspace_persona_binding',limit:1000});for(const row of bindings)if(row.value.enabled){const value=row.value,physical=this.services.resources.workspace(value.workspace_id);if(typeof physical==='string')this.workspacePaths.set(physical,{workspace_id:value.workspace_id,platform:value.platform})}if(!bindings.length)for(const[platform,id]of Object.entries(this.workspace_ids))this.workspacePaths.set(this.services.resources.workspace(id),{workspace_id:id,platform})}
+  _inHomeWorkspace(agent){
+    const cwd=agent?.session?.header?.cwd
+    return typeof cwd==='string'&&(cwd===this.homeWorkspacePath||this.services.resources.sameWorkspace?.(cwd,this.homeWorkspacePath)===true)
+  }
+  _personaPlatform(agent,context){
+    if(!this._inHomeWorkspace(agent))return null
+    if(['qq','bilibili','tieba'].includes(context.platform))return context.platform
+    const sid=sidOf({agent}),controller=this.services.session_controller
+    const stage=controller.get(sid)===agent?controller.metadata(sid)?.platform:null
+    return ['qq','bilibili','tieba'].includes(stage)?stage:'main'
+  }
   _hostContext(exec,binding){
-    const sid=sidOf(exec),space=this._workspacePlatform(exec),base={platform:'harness',...(space.workspace_id?{workspace_id:space.workspace_id}:{}),session_id:sid,conversation_id:'local-owner',owner_authorized:false,actor_uid:'',include_secret:false},s=this.services
+    const sid=sidOf(exec),base={platform:'harness',...(this._inHomeWorkspace(exec?.agent)?{workspace_id:this.workspace_ids.main}:{}),session_id:sid,conversation_id:'local-owner',owner_authorized:false,actor_uid:'',include_secret:false},s=this.services
     if(!binding||binding.purpose!=='sdk-consumed-input')return base
     if(s.session_runner.task(sid)||s.qq.chatForSession(sid)||['autonomous','memory-maintenance','internal-maintenance'].includes(s.session_controller.metadata(sid)?.purpose))return base
     if(binding.producer?.kind!=='user'||typeof binding.source_message_id!=='string'||!binding.source_message_id||binding.source_message_id.length>240||!exec?.agent)return base
@@ -233,7 +252,9 @@ class NativeCore{
   }
   context(exec){
     const sid=sidOf(exec),s=this.services,agent=exec?.agent,resolved=this.hooks?.context(exec)??{session_id:sid,platform:'harness',conversation_id:'',owner_authorized:false},task=s.session_runner.task(sid),chat=s.qq.chatForSession(sid),local=this.operatorTurns.get(sid)
-    const persona_platform=this.hooks?.platform(agent)??this._personaPlatform(agent,resolved),context={...resolved,session_id:sid,include_secret:false,can_manage:false,can_manage_qq:false,can_moderate_group:false,autonomous:false,source_scope:'',allow_observe:false,persona_platform,default_platform:['qq','tieba','bilibili'].includes(resolved.platform)?resolved.platform:persona_platform==='main'?'system':persona_platform}
+    const stage=this.hooks?this.hooks.platform(agent):this._personaPlatform(agent,resolved)
+    const persona_platform=stage&&s.profiles.enabled(stage)?stage:null
+    const context={...resolved,session_id:sid,include_secret:false,can_manage:false,can_manage_qq:false,can_moderate_group:false,autonomous:false,source_scope:'',allow_observe:false,persona_platform,default_platform:['qq','tieba','bilibili'].includes(resolved.platform)?resolved.platform:'system'}
     if(task){if(s.session_controller.get(sid)!==agent)throw new Error('SDK Agent引用与活动会话不一致');if(task.input_bound&&task.user_committed){context.autonomous=true;context.task_id=task.batch.id;context.round_id=task.batch.id;context.source_scope='activity:'+task.batch.id;context.allow_observe=true;const cap=this._maintenanceCapability(task.batch);if(cap)context.can_manage=false}}
     else if(chat){const turn=s.qq.turns.get(sid),bound=this._currentQQAuthority(exec,context);if(bound){context.task_id=turn.id;context.round_id=turn.id;context.source_scope='qq:'+turn.id;context.allow_observe=true;context.allow_current_feedback=true;context.bound_evidence_ids=[...bound.bound_evidence_ids];context.can_manage=resolved.owner_authorized===true&&chat.startsWith('private:')&&s.qq.isTurnAdmin(sid)}else{context.owner_authorized=false;context.allow_observe=false}}
     else if(local?.agent===agent){context.task_id='host:'+hash(local.message_id);context.round_id=context.task_id;context.source_scope='user:'+local.message_id;context.source_message_id=local.message_id;context.allow_observe=true;context.can_manage=resolved.owner_authorized===true}
@@ -281,6 +302,13 @@ class NativeCore{
   async _read(platform,operation,args={},context={}){
     assertRunActive()
     if(!NATIVE_READ_OPERATIONS[platform]?.includes(operation))throw new Error('未开放这个原生读取操作');if(!isPlainObject(args))throw new Error('读取参数必须为对象');this._assertRead(context,platform,operation)
+    const targetRound=platform==='tieba'&&context.round_id&&this.services.tieba.rounds.bar(context.round_id)
+    if(targetRound&&platform==='tieba'){
+      if(!['status','browse','thread','sub_replies','conversation','image','images','emotes','style_refs','bar_style'].includes(operation))throw new Error('指定贴吧轮次不允许读取其他贴吧或搜索范围')
+      if(operation==='browse'){this.services.tieba.rounds.assertBar(context.round_id,args.bar??targetRound);args={...args,bar:targetRound}}
+      if(['images','style_refs','bar_style'].includes(operation)){this.services.tieba.rounds.assertBar(context.round_id,args.bar??targetRound);args={...args,bar:targetRound}}
+      if(['thread','sub_replies','conversation'].includes(operation))this.services.tieba.rounds.assertBar(context.round_id,this.services.tieba._knownForum(args.thread_id))
+    }
     if(platform==='system'){
       if(operation==='status'){fields(args,[]);const result=await this.status();return context.can_manage||context.owner_authorized?result:{native:true,audit_only:this.audit_only,started:this.started,model_calls:0}}
       if(!context.can_manage&&!['reference_search','reference_read','learning_status','mood_status','speech_status','diary_status'].includes(operation))throw new Error('当前来源没有本机资料管理能力')
@@ -298,6 +326,10 @@ class NativeCore{
     }
     if(operation==='status'){fields(args,[]);return platform==='tieba'?this.services.tieba.status({refresh:true}):this.services[platform].status()}
     fields(args,READ_SPECS[platform]?.[operation]??[])
+    if(platform==='tieba'&&operation==='images'){
+      const tieba=this.services.tieba,task=this.services.session_runner.task(context.session_id)
+      return tieba.images({...args,bar:args.bar??tieba.mediaBar(context,task),round_id:context.round_id??context.task_id??context.source_scope??''})
+    }
     if(platform==='qq'){
       if(operation==='moderation_target'){
         const request=context.moderation_lookup;if(!this._moderationLookupAllowed(context,operation,args))throw new Error('当前消息没有已核验的管理员管理指令')
@@ -328,7 +360,21 @@ class NativeCore{
     return operation==='policy'?sharing.policy():operation==='sample'?sharing.sample(args):sharing.recordAssessment(args,context)
   }
   _sharingHints({agent,platform,context={}}={}){
-    if(platform==='tieba'){let choice='';try{choice=this.services.participation.context(this.participationAuthority({agent}))}catch{}const media=this.services.tieba.mediaContext({agent,platform,context},this.services.session_runner.task(sidOf({agent})));return [choice.length+media.length>378?choice.slice(0,80):choice,media].filter(Boolean).join('\n')}
+    const media=this._expressionHint({agent,platform,context}),other=this._platformHints({agent,platform,context})
+    if(platform==='tieba')return [other.length+media.length>378?other.slice(0,80):other,media].filter(Boolean).join('\n')
+    if(other.length+media.length>378){const summary=media.split('\n')[0];return other.length+summary.length<=378?[other,summary].filter(Boolean).join('\n'):other}
+    return [other,media].filter(Boolean).join('\n')
+  }
+  _expressionHint({agent,platform,context}){
+    const sid=sidOf({agent}),{expression_library:library,tieba,session_runner:runner,learning_runtime:learning}=this.services,task=runner.task(sid)
+    if(!['tieba','qq','bilibili'].includes(platform)||context.memory_only||task?.maintenance_kind||context.conversation_id?.startsWith('dm:'))return ''
+    if(platform==='tieba')return tieba.mediaContext({agent,platform,context},task,selection=>library.hint(selection,platform))||library.hint({items:[]},platform)
+    const query=(task?.batch.kind==='activity.incoming'?task.batch.tasks.map(row=>row.body).join(' '):learning.previews.get(sid)?.query??'').slice(0,4000)
+    const selection=query.trim()?library.list({platform,query,limit:2}):{items:[]}
+    return library.hint(selection,platform)
+  }
+  _platformHints({agent,platform}){
+    if(platform==='tieba'){try{return this.services.participation.context(this.participationAuthority({agent}))}catch{return ''}}
     if(platform==='qq'){
       // This is a capability hint, not an execution grant. A private binding
       // has one fixed peer, so it can be rendered before SDK input commitment;
@@ -349,21 +395,41 @@ class NativeCore{
     const task=this.services.session_runner.task(context.session_id)
     return this.services.image_description.describe({session_id:context.session_id,asset_ref:image.id,bytes:image.bytes,media_type:image.media_type,signal:task?.controls.signal})
   }
-  expressionList({query='',limit=12}={},context={}){if((context.default_platform??context.platform)==='tieba'){const result=this.services.tieba.images({query,limit,bar:this.services.tieba.readContexts.get(context.session_id)?.bar??'',round_id:context.round_id??context.task_id??context.source_scope??''});return {...result,items:result.items.map(({asset_id,...row})=>({...row,asset_ref:asset_id})),reference_only:true,model_calls:0}}if(typeof query!=='string'||query.length>240||!Number.isSafeInteger(limit)||limit<1||limit>30)throw new Error('表情查询范围无效');const rows=this.store.db.prepare("SELECT id FROM assets WHERE kind IN ('sticker','image') ORDER BY created_at DESC,id LIMIT 1000").all(),items=[];for(const row of rows){const raw=this.store.db.prepare('SELECT kind,media_type,manifest_json FROM assets WHERE id=?').get(row.id),manifest=JSON.parse(raw.manifest_json),entries=(manifest.catalog_entries??[]).filter(entry=>entry.historical!==true&&['shared_stickers','tieba_images'].includes(entry.collection)&&entry.enabled!==false);if(!entries.length&&!(raw.kind==='sticker'&&manifest.collection==='shared_stickers'))continue;const e=entries[0]??manifest,name=String(e.display_name??e.name??row.id).slice(0,120),description=String(e.description??'').slice(0,180),tags=(e.tags??[]).slice(0,12).map(String);if(query&&!(name+' '+description+' '+tags.join(' ')).includes(query))continue;items.push({asset_ref:row.id,name,description,tags,media_type:raw.media_type});if(items.length===limit)break}return {items,reference_only:true,model_calls:0}}
+  expressionList({query='',limit=12}={},context={}){
+    const platform=context.default_platform??context.platform
+    let result
+    if(platform==='tieba'){
+      const tieba=this.services.tieba,task=this.services.session_runner.task(context.session_id)
+      result=tieba.images({query,limit,bar:tieba.mediaBar(context,task),round_id:context.round_id??context.task_id??context.source_scope??''})
+    }else result=this.services.expression_library.list({query,limit,platform:platform==='bilibili'?'bilibili':'qq'})
+    return {...result,items:result.items.map(({asset_id,...row})=>({...row,asset_ref:asset_id})),reference_only:true,model_calls:0}
+  }
+  noteExpressionView(asset_ref,context){this.services.expression_library.viewed(asset_ref,context)}
+  saveExpression(operation,input,context){
+    this.assertMutable()
+    const task=this.services.session_runner.task(context.session_id)
+    if(context.memory_only||task?.maintenance_kind||context.conversation_id?.startsWith('dm:'))throw new Error('当前任务不能修改共享表情库')
+    const qq=this.services.qq,turn=context.platform==='qq'?qq.turns.get(context.session_id):null
+    const current=turn?.running&&turn.frozen&&context.source_scope==='qq:'+turn.id&&turn.inbound_id?qq._job(turn.inbound_id):null
+    const verifiedQQSticker=current?.kind==='qq.inbound'&&current.status==='running'&&current.target.conversation_id===context.conversation_id&&current.metadata.sticker_asset_refs?.includes(input.asset_ref)===true
+    return withRunScope(task?{...task.controls,now:this.now}:undefined,()=>this.services.expression_library.save(operation,input,context,{verifiedQQSticker}))
+  }
   adoptExpression(input,context={}){fields(input,['asset_ref','name','description','tags']);this.assertMutable();if(context.can_manage!==true)throw new Error('管理表情素材需要可信本机管理能力');if(typeof input.name!=='string'||!input.name.trim()||input.name.length>120||typeof(input.description??'')!=='string'||(input.description??'').length>500||!Array.isArray(input.tags??[])||(input.tags??[]).length>20||(input.tags??[]).some(tag=>typeof tag!=='string'||tag.length>40))throw new Error('表情名称或标签无效');const asset=this.services.assets.read(input.asset_ref);if(!asset.media_type.startsWith('image/'))throw new Error('只接受原生已登记图片');if(!this._managedAsset(asset)&&this.options.asset_management_authorizer?.({asset_ref:asset.id,context})!==true)throw new Error('私聊原图不能自动提升到共享表情库，需要本机明确素材导入来源');const result=this.services.assets.put({bytes:asset.bytes,kind:'sticker',media_type:asset.media_type,source_ref:asset.source_ref,visibility:asset.manifest.visibility??'owner',manifest:{schema_version:1,collection:'shared_stickers',catalog_entries:[{collection:'shared_stickers',source_id:asset.id,display_name:input.name,description:input.description??'',tags:input.tags??[],enabled:true,historical:false}],management_scope:context.source_scope}});return {asset_ref:result.id,name:input.name,registered:true,duplicate:result.duplicate===true,published:false}}
   _install(){
     const s=this.services,ctx=this.ctx
     this.missing_interfaces=[];for(const[key,path]of [['on',['on']],['tools.register',['tools','register']],['tools.guard',['tools','guard']],['systemPrompt.section',['systemPrompt','section']],['systemPrompt.context',['systemPrompt','context']]])if(typeof path.reduce((v,k)=>v?.[k],ctx)!=='function')this.missing_interfaces.push(key)
-    if(!this.missing_interfaces.length){this._loadWorkspaces();this.hooks=installNativeRuntimeHooks(ctx,{store:this.store,profiles:s.profiles,people:s.people,memory_runtime:s.memory,qq:s.qq,activity:s.activity,session_runner:s.session_runner,money_budget:s.money,now:this.now,host_context_resolver:(exec,binding)=>this._hostContext(exec,binding),persona_resolver:(agent,context)=>this._personaPlatform(agent,context),qq_current_authority:(exec,context)=>this._currentQQAuthority(exec,context),qq_moderation_authority:exec=>this._moderationActionAllowed(exec),qq_moderation_lookup_authority:exec=>this._qqModerationLookupAllowed(exec),qq_management_authority:exec=>this._qqManagementAllowed(exec),tool_profile:task=>task?.maintenance_kind==='people'&&this._maintenanceCapability(task.batch)?.kind==='people'?{people_maintenance:true}:task?.batch.kind==='activity.incoming'?{action_kinds:s.social.incomingActionKinds({...task.context,platform:task.batch.platform,task_id:task.batch.id,autonomous:true})}:{},maintenance_guard:(batch,name,args)=>s.memory_consolidation.capability(batch)?s.memory_consolidation.guardTool(batch,name,args):undefined,
+    if(!this.missing_interfaces.length){this.hooks=installNativeRuntimeHooks(ctx,{store:this.store,profiles:s.profiles,people:s.people,memory_runtime:s.memory,qq:s.qq,activity:s.activity,session_runner:s.session_runner,money_budget:s.money,channel_model:this.dshModel,now:this.now,host_context_resolver:(exec,binding)=>this._hostContext(exec,binding),persona_resolver:(agent,context)=>this._personaPlatform(agent,context),qq_current_authority:(exec,context)=>this._currentQQAuthority(exec,context),qq_moderation_authority:exec=>this._moderationActionAllowed(exec),qq_moderation_lookup_authority:exec=>this._qqModerationLookupAllowed(exec),qq_management_authority:exec=>this._qqManagementAllowed(exec),tool_profile:task=>task?.maintenance_kind==='people'&&this._maintenanceCapability(task.batch)?.kind==='people'?{people_maintenance:true}:task?.batch.kind==='activity.incoming'?{action_kinds:s.social.incomingActionKinds({...task.context,platform:task.batch.platform,task_id:task.batch.id,autonomous:true})}:{},maintenance_guard:(batch,name,args)=>s.memory_consolidation.capability(batch)?s.memory_consolidation.guardTool(batch,name,args):undefined,
       references:{context:input=>input.platform==='tieba'?s.tieba.styleContext(input,s.session_runner.task(sidOf({agent:input.agent}))):s.references.hints({query:input.context.query??''},{...input.context,persona_platform:input.platform})},learning:s.learning_runtime,expression:{context:input=>{const sid=sidOf({agent:input.agent});if(input.context.memory_only||s.session_runner.task(sid)?.maintenance_kind)return '';const preview=s.learning_runtime.previews.get(sid);return preview&&preview.trusted.session_id===sid?s.expression_evolution.context({platform:input.platform,query:preview.query,scene:'当前自然对话',max_chars:360},preview.trusted):''}},mood:s.mood,affect:s.affect,
-      speech:{section:input=>s.speech.section(input),context:input=>s.speech.context(input),on_event:(session,event)=>{if(!this.audit_only&&!this.closed)return s.speech.on_event(session,event)}},social:{context:input=>this._sharingHints(input),allowed_tool_names:()=>['companion_sharing','companion_participation','companion_read','companion_action','companion_diary','companion_image','companion_mood','companion_speech','qq_send_image','qq_send_voice','qq_send_video','qq_send_forward']}})
+      speech:{section:input=>s.speech.section(input),context:input=>s.speech.context(input),on_event:(session,event)=>{if(!this.audit_only&&!this.closed)return s.speech.on_event(session,event)}},social:{context:input=>this._sharingHints(input),allowed_tool_names:()=>['companion_sharing','companion_participation','companion_read','companion_action','companion_diary','companion_image','companion_mood','companion_speech','qq_send_image','qq_send_voice','qq_send_video','qq_send_forward']},on_image_viewed:(asset_ref,exec)=>this.noteExpressionView(asset_ref,this.context(exec))})
       this.toolRegistration=installNativeTools(ctx,{core:this})
+      this.offSchool=s.school.install(ctx)
       this.offTurn=ctx.on('session/event',(session,event)=>{const sid=session.header?.id??session.id;if(event.type==='turn/start')this.activeTurns.add(sid);if(event.type==='turn/end')this.activeTurns.delete(sid);if(['turn/start','turn/end'].includes(event.type))this.operatorTurns.delete(sid)})
     }
     for(const key of ['create','resume','get'])if(typeof service(ctx,'agents')?.[key]!=='function')this.missing_interfaces.push('agents.'+key)
     const activityPort={status:()=>({...s.activity.status(),available:!this.audit_only}),get runOneRound(){return !thisCore.audit_only?((platform,options)=>{thisCore.assertMutable();return s.activity.runOneRound(platform,options)}):undefined},get enqueue(){return !thisCore.audit_only?(input=>{thisCore.assertMutable();const result=s.activity.enqueue(input);thisCore._issueMaintenance('memory',result.task,{query:input.target?.query??''});return result}):undefined}},thisCore=this
     const platforms=Object.fromEntries(['qq','bilibili','tieba'].map(platform=>[platform,{status:()=>s[platform].status(),get login(){if(thisCore.audit_only)return undefined;return async(input,trustedContext)=>{thisCore.assertMutable();if(platform==='qq'&&!thisCore.leader)throw new Error('当前窗口不是渠道主实例，请在主实例管理QQ连接');return s[platform].login(input,trustedContext)}},get checkInbox(){if(thisCore.audit_only||!['bilibili','tieba'].includes(platform))return undefined;return async()=>{thisCore.assertMutable();if(!thisCore.leader)throw new Error('请在渠道主实例检查收件箱');if(platform==='tieba')return s.tieba.pollReplies({force:true});const result=await s.bilibili.pollInbox({force:true,comments_only:true});thisCore.collector.last=result;thisCore.collector.next_at=thisCore._now()+(thisCore.store.getDocument('bilibili-inbox')?.value.poll_interval_ms??180000);return result}},get reconcileToday(){if(thisCore.audit_only||platform!=='bilibili')return undefined;return async(input,trustedContext)=>{thisCore.assertMutable();if(!thisCore.leader)throw new Error('请在渠道主实例补回评论');return s.bilibili.reconcileToday(trustedContext)}},get checkPrivate(){if(thisCore.audit_only||platform!=='tieba')return undefined;return async(input,trustedContext)=>{thisCore.assertMutable();if(!thisCore.leader)throw new Error('请在渠道主实例处理贴吧私信');return s.tieba.replyPendingMessages(input,trustedContext)}},get inspectPage(){if(thisCore.audit_only||platform!=='tieba')return undefined;return async(input,trustedContext)=>{thisCore.assertMutable();return s.tieba.inspectOfficialPage(trustedContext)}},get resume(){if(thisCore.audit_only||platform!=='tieba')return undefined;return async(input,trustedContext)=>{thisCore.assertMutable();return s.tieba.resume(input,trustedContext)}}}]))
-    this.admin=installNativeAdminApi(ctx,{store:this.store,profiles:s.profiles,memory:s.memory_store,diary:s.diary,hormone:s.hormone,learning_loop:s.learning_loop,tieba_atmosphere:s.tieba.atmosphere,reconcile_publication:(input,context)=>this.reconcileTieba(input,context),expression_evolution:s.expression_evolution,persona_export:s.persona_export,tieba_diagnostics:s.tieba_diagnostics,consolidate_learning:()=>this._queueLearning({manual:true}),activity:activityPort,platforms,people:input=>s.people.list(input),people_detail:(input,context)=>s.people_summary.detail(input,context),people_source:(input,context)=>readNativePeopleSource({store:this.store,people:s.people},input,context),people_summarize:(input,context)=>{this.assertMutable();return s.people_summary.request(input,context)},people_summary_enabled:()=>this.started&&!this.closed&&!this.audit_only&&!this.store.readOnly&&this.store.getDocument('settings')?.value.enabled!==false,affinities:()=>s.qq.affinityList(),portability:s.portability,connection:this.options.connection,on_change:()=>{this.collector.next_at=0;if(this.tieba_replies_collector)this.tieba_replies_collector.next_at=0;if(this.leader)this._track(this._syncChannels(),'channels');return{restart_required:false}}})
+    const model_default={status:()=>({selection:this.dshModel()})}
+    this.admin=installNativeAdminApi(ctx,{store:this.store,profiles:s.profiles,memory:s.memory_store,diary:s.diary,hormone:s.hormone,learning_loop:s.learning_loop,tieba_atmosphere:s.tieba.atmosphere,reconcile_publication:(input,context)=>this.reconcileTieba(input,context),expression_evolution:s.expression_evolution,persona_export:s.persona_export,tieba_diagnostics:s.tieba_diagnostics,consolidate_learning:()=>this._queueLearning({manual:true}),activity:activityPort,platforms,people:input=>s.people.list(input),people_detail:(input,context)=>s.people_summary.detail(input,context),people_source:(input,context)=>readNativePeopleSource({store:this.store,people:s.people},input,context),people_summarize:(input,context)=>{this.assertMutable();return s.people_summary.request(input,context)},people_summary_enabled:()=>this.started&&!this.closed&&!this.audit_only&&!this.store.readOnly&&this.store.getDocument('settings')?.value.enabled!==false,affinities:()=>s.qq.affinityList(),portability:s.portability,school:s.school,model_default,connection:this.options.connection,on_change:()=>{this.collector.next_at=0;if(this.tieba_replies_collector)this.tieba_replies_collector.next_at=0;if(this.leader)this._track(this._syncChannels(),'channels');return{restart_required:false}}})
   }
   _memoryIdle({exclude_task_id=''}={}){
     const {session_runner:runner,qq}=this.services,own=sid=>runner.task(sid)?.batch.tasks.some(task=>task.id===exclude_task_id)
@@ -393,7 +459,7 @@ class NativeCore{
     if(!anchor&&(envelopes.length||!task.user_committed))return null
     const sources=admittedHumanSources({store:this.store,agent,messages:[],context,task,memory:s.memory_runtime,qq:s.qq}).filter(row=>row.platform===context.platform&&row.actor_uid===context.actor_uid&&row.conversation_id===context.conversation_id&&row.evidence_id&&(!context.actor_entity_id||row.actor_entity_id===context.actor_entity_id))
     if(!sources.length)return null
-    return {parts:sources.map(row=>row.text),evidence_ids:sources.map(row=>row.evidence_id),anchor:anchor??null}
+    return {parts:sources.map(row=>row.text),evidence_ids:sources.map(row=>row.evidence_id),anchor:anchor??null,bar:task.batch.tasks.find(row=>row.source_evidence_id===sources[0].evidence_id)?.target.bar}
   }
   _runnerContext(batch,base){const cap=this._maintenanceCapability(batch);if(batch.kind==='activity.maintenance'){if(!cap)throw new Error('闭门维护缺少可信后端能力登记');if(cap.kind==='memory-consolidation')return this.services.memory_consolidation.context(batch);if(cap.kind==='people')return {owner_authorized:false,include_secret:false,read_memory:false,write_memory:false};return {owner_authorized:cap.kind!=='learning',include_secret:false,read_memory:true,write_memory:cap.kind!=='learning'}}
     const rows=batch.tasks.map(task=>({task,row:task.source_evidence_id?this.store.db.prepare('SELECT * FROM evidence WHERE id=?').get(task.source_evidence_id):null})),first=rows.find(item=>item.row)?.row
@@ -427,22 +493,28 @@ class NativeCore{
     const max=p.budget?.max_task_tokens??30000,capacity=Math.min(3,Math.floor((max-1800)/1400));if(capacity<1)return{queued:false,status:'task_budget',message:'单轮Token保护不足以整理一条有来源的学习卡'}
     const items=pending.items.slice(0,capacity),estimated_tokens=1800+items.length*1400,budget=s.activity.budget.status(),remaining=budget.daily_token_limit-budget.tokens-budget.reserved_tokens
     if(remaining<estimated_tokens||!manual&&budget.autonomous_wakes>=budget.daily_wake_limit)return{queued:false,status:'budget',message:'当前剩余用量不足，学习来源保留待下次整理'}
-    if(s.money.enabled()&&s.money.status().remaining_nano<=0)return{queued:false,status:'money_budget',message:'当前费用额度不足，学习来源保持未整理'}
+    if(s.activity.moneyBudgetEnabled()&&s.money.status().remaining_nano<=0)return{queued:false,status:'money_budget',message:'当前费用额度不足，学习来源保持未整理'}
     const evidence_ids=items.map(x=>x.evidence_id),key='learning-review:'+hash(stringifyJson([evidence_ids,manual,this._now()])),result=s.activity.enqueue({platform:'qq',kind:'maintenance',trigger:manual?'manual':'autonomous',target:{maintenance_kind:'learning',evidence_ids,no_publication:true,source_platforms:[...new Set(items.map(x=>x.platform))]},human:false,heavy:true,estimated_tokens,idempotency_key:key})
     this._issueMaintenance('learning',result.task)
     s.learning_loop.markReviewed({evidence_ids,outcome:'queued',task_id:result.task.id},trusted)
     return{queued:!result.duplicate,status:result.duplicate?'pending':'queued',task_id:result.task.id,task:result.task,source_count:evidence_ids.length,pending_sources:pending.pending_count,model_calls:0}
   }
-  _runModel(batch,controls){if(this._maintenanceCapability(batch)?.kind==='people')batch={...batch,model:{...batch.model,reasoning_effort:'low',max_output_tokens:Math.min(batch.model?.max_output_tokens??4096,4096),max_steps:Math.min(batch.model?.max_steps??3,3)}};return withRunScope({...controls,now:this.now},()=>this._runModelInScope(batch,controls))}
-  _incomingModelGate(task){
+  _runModel(batch,controls){if(this._maintenanceCapability(batch)?.kind==='people')batch={...batch,model:{...batch.model,max_output_tokens:Math.min(batch.model?.max_output_tokens??4096,4096),max_steps:Math.min(batch.model?.max_steps??3,3)}};return withRunScope({...controls,now:this.now},()=>this._runModelInScope(batch,controls))}
+  _incomingModelGate(task,cache){
     if(task.kind!=='activity.incoming'||task.metadata.human!==true||task.target.no_publication===true)return null
     const t=task.target,ids=keys=>keys.every(key=>typeof t[key]==='string'&&/^[1-9][0-9]*$/.test(t[key]))
-    let next
-    if(task.platform==='tieba'&&t.channel==='comment'&&ids(['thread_id','post_id']))next=this.services.tieba.nextIncomingReplyAt({sub:true})
-    else if(task.platform==='bilibili'&&(ids(['object_id','root_reply_id','parent_reply_id'])||t.channel==='dm'&&ids(['recipient_uid'])||t.channel==='live'&&ids(['room_id','reply_uid'])))next=this.services.bilibili.nextIncomingReplyAt()
+    const {platform}=task
+    let read
+    if(platform==='tieba'&&t.channel==='comment'&&ids(['thread_id','post_id']))read=()=>this.services.tieba.nextIncomingReplyAt({sub:true})
+    else if(platform==='bilibili'&&(ids(['object_id','root_reply_id','parent_reply_id'])||t.channel==='dm'&&ids(['recipient_uid'])||t.channel==='live'&&ids(['room_id','reply_uid'])))read=()=>this.services.bilibili.nextIncomingReplyAt()
+    if(!read)return null
+    // Quotas are shared by the platform. Reuse the read only within the
+    // synchronous queue pass and recheck before starting the claimed batch.
+    const next=cache?.has(platform)?cache.get(platform):read()
+    cache?.set(platform,next)
     return Number.isSafeInteger(next)&&next>this._now()?{reason:'reply_wait',next_eligible_at:next}:null
   }
-  _runModelInScope(batch,controls){if(this.audit_only||!this.leader||this.closed)return{status:'not_started',retry:true,reason:'当前实例只读或未持有渠道租约'};if(batch.platform==='bilibili'&&['activity.incoming','activity.explore'].includes(batch.kind)){const ready=this.services.bilibili.readAvailability({reserve_inbox:batch.kind==='activity.explore'&&batch.trigger==='autonomous'});if(!ready.allowed)return{status:'not_started',retry:true,reason:ready.message,not_before:ready.not_before}};if(batch.kind==='activity.maintenance'&&!this._maintenanceCapability(batch))return{status:'not_started',retry:false,reason:'闭门维护缺少可信后端能力，不从task target授予权限'};if(batch.kind==='activity.explore'&&['tieba','bilibili'].includes(batch.platform))this.services[batch.platform].rounds.begin(batch.id,{limits:batch.tasks[0]?.target.round_limits});const next=(batch,controls)=>this.services.session_runner.run(batch,controls),result=this.services.memory_consolidation.capability(batch)?this.services.memory_consolidation.run(batch,controls,next):next(batch,controls);return batch.kind==='activity.maintenance'&&batch.tasks[0]?.target.maintenance_kind==='learning'?Promise.resolve(result).then(outcome=>outcome?.status==='not_started'?{...outcome,retry:false}:outcome):result}
+  _runModelInScope(batch,controls){if(this.audit_only||!this.leader||this.closed)return{status:'not_started',retry:true,reason:'当前实例只读或未持有渠道租约'};if(batch.platform==='bilibili'&&['activity.incoming','activity.explore'].includes(batch.kind)){const ready=this.services.bilibili.readAvailability({reserve_inbox:batch.kind==='activity.explore'&&batch.trigger==='autonomous'});if(!ready.allowed)return{status:'not_started',retry:true,reason:ready.message,not_before:ready.not_before}};if(batch.kind==='activity.maintenance'&&!this._maintenanceCapability(batch))return{status:'not_started',retry:false,reason:'闭门维护缺少可信后端能力，不从task target授予权限'};if(batch.kind==='activity.explore'&&['tieba','bilibili'].includes(batch.platform))this.services[batch.platform].rounds.begin(batch.id,{limits:batch.tasks[0]?.target.round_limits,...(batch.platform==='tieba'&&batch.tasks[0]?.target.bar?{bar:batch.tasks[0].target.bar}:{})});const next=(batch,controls)=>this.services.session_runner.run(batch,controls),result=this.services.memory_consolidation.capability(batch)?this.services.memory_consolidation.run(batch,controls,next):next(batch,controls);return batch.kind==='activity.maintenance'&&batch.tasks[0]?.target.maintenance_kind==='learning'?Promise.resolve(result).then(outcome=>outcome?.status==='not_started'?{...outcome,retry:false}:outcome):result}
   _pidAlive(pid){try{process.kill(pid,0);return true}catch(error){return error.code!=='ESRCH'}}
   _claimLeader(){if(this.audit_only||this.closed||this.store.readOnly)return false;return this.store.transaction(()=>{const doc=this.store.getDocument('runtime-lease:channels'),old=doc?.value;if(doc&&doc.type!=='runtime_lease')throw new Error('渠道租约类型异常');if(old?.holder_id&&old.lease_until!==0&&old.holder_id!==this.holder_id){const registered=typeof this.services.resources.isRegisteredProcessActive==='function'&&this.services.resources.isRegisteredProcessActive({pid:old.pid,token:old.holder_id});if(registered||this._pidAlive(old.pid))return false}this.store.putDocument({id:'runtime-lease:channels',type:'runtime_lease',expected_revision:doc?.revision??0,value:{scope:'channels',holder_id:this.holder_id,pid:process.pid,lease_until:this._now()+30000,renewed_at:this._now()}});return true})}
   _releaseLeader(){if(this.store.readOnly)return;this.store.transaction(()=>{const doc=this.store.getDocument('runtime-lease:channels');if(doc?.value.holder_id===this.holder_id)this.store.putDocument({id:doc.id,type:doc.type,expected_revision:doc.revision,value:{...doc.value,lease_until:0,renewed_at:this._now()}})})}
@@ -475,6 +547,7 @@ class NativeCore{
     if(!this.flights.channels)this._track(this._syncChannels(),'channels')
     if(!this.flights.tieba_sign)this._track(this.services.sign_scheduler.pulse(),'tieba_sign')
     if(!this.flights.scheduled_monitors)this._track(this.services.scheduled_rounds.pulseMonitors(),'scheduled_monitors')
+    if(!this.flights.school)this._track(this.services.school.pulse(),'school')
     try{this.services.speech.scan({limit:200})}catch(error){this._warn(error)}
     try{this.services.learning_runtime.scanPublications({limit:200})}catch(error){this._warn(error)}
     if(this._now()>=(this.next_expression_scan??0)&&this._memoryIdle()){this.next_expression_scan=this._now()+60000;for(const platform of ['main','tieba','bilibili','qq'])try{const trusted={capability:this.expression_capability},status=this.services.expression_evolution.status({platform},trusted);this.services.expression_evolution.scan({platform,expected_revision:status.revision},trusted)}catch(error){this._warn(error)}}
@@ -499,7 +572,7 @@ class NativeCore{
   activate(){return this.start({audit_only:false})}
   async _stopChannels(){this.services.tieba.inbox.connection?.close();this.services.bilibili.liveConnection?.public.close();await this.services.qq.stop()}
   async status(){const s=this.services,ports={sdk_hooks:!!this.hooks,native_tools:!!this.toolRegistration,agent_registry:['create','resume','get'].every(key=>typeof service(this.ctx,'agents')?.[key]==='function'),image_attachments:typeof service(this.ctx,'attachments')?.saveImages==='function',admin_routes:!!this.admin,admin_server:typeof service(this.ctx,'webServer')?.register==='function',admin_connection_policy:!!this.options.connection||typeof service(this.ctx,'connection')?.requestRejection==='function',sdk:this.options.sdk?'injected':'host_module',http:this.options.fetcher?'injected':'host_fetch',qq_transport:this.options.qq_connection_factory?'injected':'native_websocket',resource_runner:typeof s.resources.resourceRunner==='function',transcriber:typeof s.resources.transcriber==='function',card_renderer:typeof s.resources.cardRenderer==='function'};return {native:true,schema_version:3,started:this.started,closed:this.closed,audit_only:this.audit_only,leader:this.leader,process_registered:!!s.resources.process_file,owner_principal_known:!!this._ownerEntity(),missing_interfaces:[...this.missing_interfaces,...(!this._ownerEntity()?['operator.owner_principal']:[])],fully_wired:this.missing_interfaces.length===0,ports,activity_budget:s.activity.status().budget,collector:{...this.collector},services:{profiles:true,people:true,memory:true,references:true,learning:true,learning_loop:true,mood:true,hormone:true,speech:true,resources:true,social:true,activity:true,diary:true,portability:true},platforms:{qq:s.qq.status(),bilibili:await s.bilibili.status(),tieba:await s.tieba.status()},model_calls:0,last_error:this.last_error}}
-  async close(){if(this.closePromise)return this.closePromise;this.closed=true;this.audit_only=true;this.started=false;for(const timer of this.timers)clearInterval(timer);this.timers=[];this.closePromise=(async()=>{for(const task of [...this.services.session_runner.pending.values()])task.abort?.();for(const sid of this.services.qq.ready_sessions)await this.services.session_controller.stop({session_id:sid}).catch(()=>{});await this._stopChannels();await Promise.allSettled([...this.running]);await this.services.session_names.close();this._releaseLeader();this.leader=false;this.offTurn?.();this.toolRegistration?.dispose?.();this.hooks?.dispose?.();this.services.affect.dispose();this.services.learning_runtime.dispose();this.admin?.dispose?.();this.services.sign_scheduler.close();this.services.bilibili.close();this.services.tieba.close();this.services.memory.close();this.services.resources.close();this.operatorTurns.clear();resourcesOwners.delete(this.services.resources);installed.delete(this.ctx);return{closed:true}})();return this.closePromise}
+  async close(){if(this.closePromise)return this.closePromise;this.closed=true;this.audit_only=true;this.started=false;for(const timer of this.timers)clearInterval(timer);this.timers=[];this.closePromise=(async()=>{for(const task of [...this.services.session_runner.pending.values()])task.abort?.();for(const sid of this.services.qq.ready_sessions)await this.services.session_controller.stop({session_id:sid}).catch(()=>{});await this._stopChannels();await Promise.allSettled([...this.running]);await this.services.session_names.close();this._releaseLeader();this.leader=false;this.offTurn?.();this.offSchool?.();this.toolRegistration?.dispose?.();this.hooks?.dispose?.();this.services.affect.dispose();this.services.learning_runtime.dispose();this.admin?.dispose?.();this.services.sign_scheduler.close();this.services.bilibili.close();this.services.tieba.close();this.services.memory.close();this.services.resources.close();this.operatorTurns.clear();resourcesOwners.delete(this.services.resources);installed.delete(this.ctx);return{closed:true}})();return this.closePromise}
 }
 
 export function createNativeCore(ctx,options={}){if(!ctx||typeof ctx!=='object')throw new Error('需要真实SDK宿主上下文');const existing=installed.get(ctx);if(existing){if(existing.store!==options.store)throw new Error('同一SDK宿主不能切换到另一原生库');return existing}const core=new NativeCore(ctx,options);installed.set(ctx,core);return core}

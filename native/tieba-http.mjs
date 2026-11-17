@@ -78,17 +78,30 @@ function pbUser(bytes){const row={uid:'',name:'',name_show:'',portrait:''};for(c
 export function encodeProfileRequest({portrait,bduss=''}){return pbBytes(1,Buffer.concat([pbInt(2,1),pbInt(15,1),pbString(16,portrait),pbBytes(9,common(bduss))]))}
 export function parseUserProfile(bytes){const fields=pbFields(bytes),error=fields.find(x=>x.field===1)?.bytes;if(error){const code=pbFields(error).find(x=>x.field===1)?.value??0n;if(code!==0n){const failure=new TiebaError('官方用户资料读取被拒绝','read_failed');failure.server_code=Number(code);throw failure}}const data=fields.find(x=>x.field===2)?.bytes,user=data&&pbFields(data).find(x=>x.field===1)?.bytes;if(!user)throw new TiebaError('官方用户资料缺少身份字段','invalid_response');return pbUser(user)}
 export function parsePagePosts(bytes){const rows=[];for(const top of pbFields(bytes))if(top.field===2&&top.bytes)for(const p of pbFields(top.bytes))if(p.field===6&&p.bytes){const row={post_id:'',floor:0,author_uid:'',likes:0,reply_count:0,source_at:0,text:''},parts=[];for(const f of pbFields(p.bytes)){if(f.value!==undefined){if(f.field===1)row.post_id=f.value.toString();else if(f.field===3)row.floor=small(f.value);else if(f.field===4)row.source_at=small(f.value)*1000;else if(f.field===19)row.author_uid=f.value.toString();else if(f.field===13)row.reply_count=small(f.value)}else if(f.field===5&&f.bytes)parts.push(f.bytes);else if(f.field===37&&f.bytes)for(const a of pbFields(f.bytes))if(a.field===1&&a.value!==undefined)row.likes=small(a.value)}if(row.floor&&row.post_id)rows.push({...row,...parseTiebaContent(parts)})}return rows}
+/** SimpleForum and ThreadInfo fields returned by the official PbPage API. */
+function postPageIdentity(fields){
+  const parts=number=>{const bytes=fields.find(row=>row.field===number)?.bytes;return bytes?pbFields(bytes):[]}
+  const forum=parts(2),thread=parts(8)
+  const number=(rows,field)=>rows.find(row=>row.field===field)?.value?.toString()??''
+  const label=(rows,field)=>{const bytes=rows.find(row=>row.field===field)?.bytes;return bytes?utf8(bytes).trim():''}
+  const forum_id=number(forum,1),thread_id=number(thread,1),thread_forum_id=number(thread,27)
+  const forum_name=/^[1-9]\d*$/.test(forum_id)&&(!thread_forum_id||thread_forum_id==='0'||thread_forum_id===forum_id)?label(forum,2):''
+  return {forum_id,thread_id,forum_name,thread_title:label(thread,3)}
+}
+export function parsePostIdentity(bytes){
+  const top=pbFields(bytes),data=top.find(row=>row.field===2)?.bytes,error=top.find(row=>row.field===1)?.bytes
+  if(!data||error&&pbFields(error).some(row=>row.field===1&&row.value!==undefined&&row.value!==0n))return {}
+  return postPageIdentity(pbFields(data))
+}
 /** Pagination and forum identity from the same official PbPage response. */
 export function parsePostPage(bytes){
   const top=pbFields(bytes),data=top.find(row=>row.field===2)?.bytes,error=top.find(row=>row.field===1)?.bytes
   if(error){const rows=pbFields(error),code=rows.find(row=>row.field===1)?.value??0n;if(code!==0n)throw new TiebaError('官方楼层读取被拒绝','read_failed',{server_code:small(code)})}
   if(!data)throw new TiebaError('官方楼层数据缺失','invalid_response')
-  const fields=pbFields(data),page=fields.find(row=>row.field===3)?.bytes,forum=fields.find(row=>row.field===2)?.bytes,ints=page?pbFields(page):[]
+  const fields=pbFields(data),page=fields.find(row=>row.field===3)?.bytes,ints=page?pbFields(page):[]
   const number=field=>{const value=ints.find(row=>row.field===field)?.value;return value===undefined?null:small(value)},current_page=number(3),total_page=number(5)
   if(!current_page||!total_page||current_page>total_page||total_page>1000000)throw new TiebaError('官方分页坐标无法核验','invalid_response')
-  const forum_id=forum?pbFields(forum).find(row=>row.field===1)?.value?.toString()??'':''
-  const thread=fields.find(row=>row.field===8)?.bytes,thread_id=thread?pbFields(thread).find(row=>row.field===1)?.value?.toString()??'':''
-  return {posts:parsePagePosts(bytes),forum_id,thread_id,page:{current_page,total_page,total_count:number(4)},response_sha256:createHash('sha256').update(bytes).digest('hex')}
+  return {posts:parsePagePosts(bytes),...postPageIdentity(fields),page:{current_page,total_page,total_count:number(4)},response_sha256:createHash('sha256').update(bytes).digest('hex')}
 }
 export function parseSubPosts(bytes){const rows=[];for(const top of pbFields(bytes))if(top.field===2&&top.bytes)for(const p of pbFields(top.bytes))if(p.field===4&&p.bytes){const row={sub_reply_id:'',floor:0,likes:0,source_time:0,text:'',author:{uid:'',name:'',name_show:'',portrait:''}},parts=[];for(const f of pbFields(p.bytes)){if(f.value!==undefined){if(f.field===1)row.sub_reply_id=f.value.toString();else if(f.field===3)row.source_time=small(f.value);else if(f.field===6)row.floor=small(f.value)}else if(f.field===2&&f.bytes){parts.push(f.bytes);const content=pbFields(f.bytes),type=content.find(part=>part.field===1)?.value,uid=content.find(part=>part.field===15)?.value;if(type===4n&&uid)row.mention_uids=[...(row.mention_uids??[]),uid.toString()]}else if(f.field===7&&f.bytes)row.author=pbUser(f.bytes);else if(f.field===9&&f.bytes)for(const a of pbFields(f.bytes))if(a.field===1&&a.value!==undefined)row.likes=small(a.value)}if(row.sub_reply_id)rows.push({...row,...parseTiebaContent(parts)})}return rows}
 export function parseSubPage(bytes){

@@ -1,4 +1,5 @@
 import {NativeRoundPolicy} from './round-policy.mjs'
+export const TIEBA_READ_MAX_CHARS=4000
 /** Canonical platform reads shared by the runtime and model tool schema. */
 export const NATIVE_READ_OPERATIONS=Object.freeze({
   system:['status','tieba_diagnostics','persona_export','capabilities','resources','people','reference_search','reference_read','learning_status','mood_status','speech_status','diary_status'],qq:['status','history','recent','groups','members','moderation_target'],
@@ -21,7 +22,7 @@ export function nativeReadParameters(onlyPlatform){
   const branches=[]
   for(const platform of platforms)for(const operation of NATIVE_READ_OPERATIONS[platform]){
     const fields=NATIVE_READ_SPECS[platform]?.[operation]??[],need=Array.isArray(required[operation])?required[operation]:required[operation]?.[platform]??[]
-    const args=platform==='system'?{type:'object',additionalProperties:true}:object(Object.fromEntries(fields.map(key=>[key,types[key]??text(240)])),need)
+    const args=platform==='system'?{type:'object',additionalProperties:true}:object(Object.fromEntries(fields.map(key=>[key,platform==='tieba'&&key==='max_chars'?{...types.max_chars,maximum:TIEBA_READ_MAX_CHARS}:types[key]??text(240)])),need)
     branches.push(object({platform:{type:'string',enum:[platform]},operation:{type:'string',enum:[operation]},args},['operation',...(need.length?['args']:[])]))
   }
   return {type:'object',properties:{platform:{type:'string',enum:platforms},operation:{type:'string',enum:[...new Set(platforms.flatMap(p=>NATIVE_READ_OPERATIONS[p]))]},args:{type:'object'}},required:['operation'],additionalProperties:false,anyOf:branches}
@@ -49,7 +50,7 @@ export function nativeActivityReadHints(store,batch){
     return common+reading+discussion+'对视频发表评论用kind=bilibili.comment、target={object_id:aid,object_type:"1"}，回复别人用bilibili.reply并保留真实root_reply_id和parent_reply_id。新评论和回复网友合计遵守本轮评论总上限；多条互相独立的评论或回复尽量在同一次响应提交工具调用，减少模型往返。不逐个复述预览或长篇比较；没有合适内容可以不说，不为凑上限硬评。'
   }
   if(batch.platform==='tieba'){
-    if(batch.kind==='activity.incoming'&&batch.tasks?.every(task=>task.target?.channel==='comment'))return common+'这是评论回复监测送来的真实新消息，正文和已核验坐标在本次线索中。结合本轮已核验往来与当前有效人设决定回应，事实和作者归属以真实原文为准。要回必须调用发表工具，只有final文字不算发出；不想回可明确跳过。需要主楼和楼中楼上下文时优先conversation(thread_id,post_id,limit?,sub_limit?)，父楼用limit，子楼用sub_limit（1至30，默认沿用limit），一次读取两部分，分别保留作者和来源；只缺其中一部分时仍可单独thread或sub_replies；逐层看floor、author_uid和正文，不猜“有道理”指向邻楼。每条最多回复一次：kind=tieba.reply，target只复制bar、thread_id、post_id以及存在的sub_reply_id、reply_uid，body自己写，mode=go。不能改开帖子新楼，找不到原评论就跳过；不重新浏览、不重复发表。'
+    if(batch.kind==='activity.incoming'&&batch.tasks?.every(task=>task.target?.channel==='comment'))return common+'这是评论回复监测送来的真实新消息，正文和已核验坐标在本次线索中。'+(batch.tasks.some(task=>task.metadata?.trigger==='manual')?'按主人明确要求处理原文。':'结合当前有效人设、原文及已核验上下文，先用companion_participation逐条选择reply或skip；选reply后才可发表，多条分别使用source_message_id。')+'事实和作者归属以真实原文为准。需要主楼和楼中楼上下文时优先conversation(thread_id,post_id,limit?,sub_limit?)，父楼用limit，子楼用sub_limit（1至30，默认沿用limit），一次读取两部分，分别保留作者和来源；只缺其中一部分时仍可单独thread或sub_replies；逐层看floor、author_uid和正文，不猜“有道理”指向邻楼。每条最多回复一次：kind=tieba.reply，target只复制bar、thread_id、post_id以及存在的sub_reply_id、reply_uid，body自己写，mode=go。不能改开帖子新楼，找不到原评论就跳过；不重复发表。'
 
     const bars=store.getDocument('tieba')?.value.tieba?.bars??[],seed=String(batch.tasks?.[0]?.id??'').split('').reduce((n,c)=>n+c.charCodeAt(0),0),bar=batch.tasks?.[0]?.target?.bar??(bars.length?bars[seed%bars.length]:null)
     const reads=round.read,replies=round.reply,subs=round.sub_reply

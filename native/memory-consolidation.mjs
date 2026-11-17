@@ -5,6 +5,7 @@ import {stringifyJson} from './contracts.mjs'
 import {contextOf,fields,integer,uid,rawText,digest,canonicalEvidenceRank} from './memory-rules.mjs'
 import {effectiveActivityPolicy} from './budget-override.mjs'
 import {shanghaiTime,valleyDecision} from '../policy.mjs'
+import {qqProactiveTargets} from './protocol/chat.js'
 
 const PREFIX='native:memory-consolidation:',STATE=PREFIX+'state',SOURCE_TYPE='native_memory_consolidation'
 const OPEN=['queued','leased','running'],PLATFORMS=['qq','tieba','bilibili']
@@ -58,7 +59,7 @@ export class NativeMemoryConsolidation {
       &&!pending.some(task=>task.platform===platform&&task.metadata.execution==='model'&&!monitored(task)&&(task.kind!=='activity.incoming'||['leased','running'].includes(task.status)||['ready','batching'].includes(this.activity._gate(task,{value:state},p,{include_batch:false}).reason)))))return true
     const hour=shanghaiTime(now).hour,start=p.qq?.quiet_start_hour??1,end=p.qq?.quiet_end_hour??8,quiet=start===end?false:start<end?hour>=start&&hour<end:hour>=start||hour<end
     return Number.isSafeInteger(idle.next_chat_at)&&now>=idle.next_chat_at&&!quiet&&available('qq')&&!pending.some(task=>task.platform==='qq')
-      &&(cfg.qq_targets??['owner','group']).some(target=>target==='owner'&&!!p.qq?.owner_conversation||target==='group'&&(p.qq?.group_conversations??[]).length>0)
+      &&qqProactiveTargets(p).length>0
   }
   _idle(exclude_task_id=''){
     if(this.is_idle({exclude_task_id})!==true)return false
@@ -187,7 +188,7 @@ export class NativeMemoryConsolidation {
       // UTF-8 bytes are a conservative source token bound; retain the existing
       // model/output settings and charge this through the ordinary reservation.
       const p=this._policy(),estimated_tokens=4000+Buffer.byteLength(selection.payload)+(p.model?.max_output_tokens??1800),budget=this.activity.budget.status()
-      status=estimated_tokens>(p.budget?.max_task_tokens??30000)?'task_budget':budget.tokens+budget.reserved_tokens+estimated_tokens>budget.daily_token_limit||budget.autonomous_wakes>=budget.daily_wake_limit?'budget':this.activity.money?.enabled()&&this.activity.money.status().remaining_nano<=0?'money_budget':null
+      status=estimated_tokens>(p.budget?.max_task_tokens??30000)?'task_budget':budget.tokens+budget.reserved_tokens+estimated_tokens>budget.daily_token_limit||budget.autonomous_wakes>=budget.daily_wake_limit?'budget':this.activity.moneyBudgetEnabled()&&this.activity.money.status().remaining_nano<=0?'money_budget':null
       if(status){this._put(STATE,state);return {queued:false,status,model_calls:0}}
       const {domain,cutoff,sources,max_chars}=selection,platform=PLATFORMS.includes(domain.platform)?domain.platform:'qq'
       const result=this.activity.enqueue({platform,kind:'maintenance',trigger:'autonomous',human:false,heavy:true,estimated_tokens,

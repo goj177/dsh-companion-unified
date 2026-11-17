@@ -21,7 +21,7 @@ const morphologyTerms=value=>{
   return [...new Set([...segmenter.segment(value)].filter(row=>row.isWordLike).map(row=>/^[\p{Script=Han}][了着过]$/u.test(row.segment)?row.segment[0]:row.segment).filter(word=>/^\p{Script=Han}$/u.test(word)&&!morphologyStop.has(word)))].slice(0,8)
 }
 const manifests=manifest=>[manifest,...(Array.isArray(manifest.registrations)?manifest.registrations.filter(isPlainObject).map(row=>row.manifest).filter(isPlainObject):[])]
-function entriesOf(manifest){
+export function tiebaMediaEntries(manifest){
   return manifests(manifest).flatMap(source=>[
     ...(Array.isArray(source.catalog_entries)?source.catalog_entries.filter(isPlainObject):[]),
     ...(COLLECTIONS.has(source.collection)&&source.historical===false?[source]:[]),
@@ -29,17 +29,21 @@ function entriesOf(manifest){
 }
 function relevance(item,query,words){
   if(!query)return 0
+  if(item.avoid_when?.some(value=>query.includes(normal(value))))return 0
   // Imported catalogue notes often quote the comment where an image was
   // collected. Neither its author nor that comment describes the pixels.
   const name=/^[a-f0-9]{8,64}$/i.test(item.name)?'':normal(item.name),description=item.description_kind==='source_note'?'':normal(item.description),tags=item.tags.map(normal)
   let score=name===query?60:name.includes(query)?24:0
   if(description.includes(query))score+=12
   if(tags.includes(query))score+=30
+  const usage=normal(item.use_when)
+  if(usage.includes(query))score+=18
   for(const word of words){
     if(tags.includes(word))score+=12
     else if(tags.some(tag=>tag.includes(word)))score+=7
     if(name.includes(word))score+=9
     if(description.includes(word))score+=3
+    if(usage.includes(word))score+=6
   }
   // A single meaningful word such as 钓 can discover a visually tagged 钓鱼
   // image. This is weaker than every full-word match and never applies to
@@ -51,7 +55,7 @@ function relevance(item,query,words){
 /** assets are verified NativeAssets rows with id/kind/media_type/byte_size and
  * parsed manifest. last_used_at_by_asset must include upload-attempt history,
  * since an unknown publication must not silently make the image reusable. */
-export function selectTiebaMedia({assets=[],bar='',query='',now=Date.now(),limit=6,last_used_at_by_asset={},budget={}}={}){
+export function selectTiebaMedia({assets=[],bar='',query='',now=Date.now(),limit=6,last_used_at_by_asset={},budget={},platform='tieba'}={}){
   if(!Array.isArray(assets)||assets.length>10000||typeof bar!=='string'||bar.length>1440||typeof query!=='string'||query.length>4000)throw new Error('贴吧图片候选参数无效')
   if(!Number.isSafeInteger(limit)||limit<1||limit>50)throw new Error('贴吧图片候选数量必须为1至50')
   nonnegative(now,'当前时间')
@@ -63,16 +67,16 @@ export function selectTiebaMedia({assets=[],bar='',query='',now=Date.now(),limit
     if(!isPlainObject(asset)||!ASSET.test(asset.id??'')||!isPlainObject(asset.manifest)){block('invalid_asset');continue}
     if(seen.has(asset.id))continue;seen.add(asset.id)
     if(!['image','sticker'].includes(asset.kind)||!TYPES.has(asset.media_type)){block('unsupported_type');continue}
-    const manifest=asset.manifest,entries=entriesOf(manifest)
+    const manifest=asset.manifest,entries=tiebaMediaEntries(manifest)
     // A public image read from somebody's post is not a collected expression.
     // An explicit current managed registration is the publication grant, even
     // when the original bytes retain an owner/conversation visibility label.
     if(!entries.length){block(manifest.visibility==='public'?'unmanaged':'private');continue}
     if(entries.some(entry=>entry.enabled===false)){block('disabled');continue}
     if(entries.some(entry=>entry.disabled_bars!==undefined&&(!Array.isArray(entry.disabled_bars)||entry.disabled_bars.some(value=>typeof value!=='string')))){block('invalid_policy');continue}
-    if(!currentBar&&entries.some(entry=>entry.disabled_bars?.length)){block('bar_scope_unknown');continue}
-    if(entries.some(entry=>(entry.disabled_bars??[]).some(value=>value.trim()===currentBar))){block('bar_disabled');continue}
-    if(!canPublishAsset(asset,{platform:'tieba',bar:currentBar})){block('not_publishable');continue}
+    if(platform==='tieba'&&!currentBar&&entries.some(entry=>entry.disabled_bars?.length)){block('bar_scope_unknown');continue}
+    if(platform==='tieba'&&entries.some(entry=>(entry.disabled_bars??[]).some(value=>value.trim()===currentBar))){block('bar_disabled');continue}
+    if(!canPublishAsset(asset,{platform,bar:currentBar})){block('not_publishable');continue}
     if(!Number.isSafeInteger(asset.byte_size)||asset.byte_size<=0){block('size_unknown');continue}
     if(asset.byte_size>MAX_BYTES){block('oversize');continue}
     const used=last_used_at_by_asset instanceof Map?last_used_at_by_asset.get(asset.id):last_used_at_by_asset[asset.id]
@@ -86,6 +90,11 @@ export function selectTiebaMedia({assets=[],bar='',query='',now=Date.now(),limit
     const visual=isPlainObject(candidate)&&candidate.asset_ref===asset.id&&candidate.asset_sha256===asset.id.slice(6)&&candidate.analysis_version===1&&typeof candidate.description==='string'&&candidate.description.trim()&&typeof candidate.confidence==='number'&&candidate.confidence>=0.65&&candidate.confidence<=1&&Array.isArray(candidate.scene_tags)&&Array.isArray(candidate.emotion_tags)?candidate:null
     const originalName=clean(entry.display_name??entry.name??manifest.display_name??manifest.name??'收藏图片',120),visualTags=visual?[...visual.scene_tags,...visual.emotion_tags].slice(0,14).map(tag=>clean(tag,40)).filter(Boolean):[]
     const item={asset_id:asset.id,name:visual&&/^[a-f0-9]{8,64}$/i.test(originalName)?clean(visual.description,24):originalName,description:visual?clean(visual.description,160):sourceNote?description.replace(/^[^：:]{1,50}[：:]/u,''):description,tags:[...new Set([...rawTags.filter(tag=>tag!=='偷来的'),...visualTags])].slice(0,20),...(visual?{description_kind:'visual_summary',visual_confidence:visual.confidence,visual_scene_tags:visual.scene_tags.map(value=>clean(value,20)),...(visual.visible_text?{visual_text:clean(visual.visible_text,160)}:{}),avoid_in:(visual.avoid_in??[]).slice(0,4).map(value=>clean(value,40))}:sourceNote?{description_kind:'source_note'}:{}),needs_visual_check:!visual,media_type:asset.media_type,byte_size:asset.byte_size,available:true,last_used_at}
+    const remembered=entries.filter(entry=>['shared_sticker_collect','shared_sticker_usage'].includes(entry.producer)).sort((a,b)=>(b.learned_at??0)-(a.learned_at??0))[0]
+    if(remembered){
+      item.use_when=clean(remembered.use_when,120)
+      item.avoid_when=(Array.isArray(remembered.avoid_when)?remembered.avoid_when:[]).slice(0,4).map(value=>clean(value,40)).filter(Boolean)
+    }
     const score=relevance(item,needle,words)
     if(needle&&score===0){block('query_unmatched');continue}
     items.push({...item,relevance:score})
@@ -97,18 +106,19 @@ export function selectTiebaMedia({assets=[],bar='',query='',now=Date.now(),limit
 
 /** Keep complete asset IDs and complete candidate lines; never truncate an ID
  * into an unpublishable reference or expose excluded/private metadata. */
-export function compactTiebaMediaHint(selection,{max_chars=240,max_items=2}={}){
+export function compactTiebaMediaHint(selection,{max_chars=240,max_items=2,send_with='target.asset_ids',view_with='companion_image'}={}){
   if(!isPlainObject(selection)||!Array.isArray(selection.items)||!Number.isSafeInteger(max_chars)||max_chars<0||max_chars>240||!Number.isSafeInteger(max_items)||max_items<1||max_items>2)throw new Error('贴吧图片提示参数无效')
   if(max_chars<100)return ''
   if(!selection.items.length){const note='【收藏图】暂无相关候选。想配图可read images不填query查少量收藏，再companion_image看图；不必为配图换话题。';return note.length<=max_chars?note:''}
   const needsLook=selection.items.some(item=>item.needs_visual_check!==false),allNeedLook=selection.items.every(item=>item.needs_visual_check!==false)
-  const heading='【收藏图候选·资料】',suffix=allNeedLook?'先companion_image看原图，合适才填target.asset_ids；来源备注不等于画面，不必每条带图。':needsLook?'已有看图描述可据此选；标“待看”的先companion_image，合适才填target.asset_ids，不必每条配图。':'已有原图描述，可据此选；拿不准再companion_image。合适才填target.asset_ids，不必每条配图。',lines=[]
+  const heading='【收藏图候选·资料】',suffix=allNeedLook?'先用 '+view_with+' 看原图，合适才用 '+send_with+'。':needsLook?'标“待看”的先用 '+view_with+' 查看，合适才用 '+send_with+'。':'已有原图描述，拿不准就用 '+view_with+' 查看。合适才用 '+send_with+'。',lines=[]
   for(const item of selection.items){
     if(lines.length>=max_items)break
     if(item.available!==true||!ASSET.test(item.asset_id??''))continue
     let line
     for(const chars of [24,12,0]){
-      const candidate=item.asset_id+' '+(!allNeedLook&&item.needs_visual_check!==false?'待看 ':'')+JSON.stringify(clean(item.name,12))+(chars?' '+JSON.stringify(clean(item.description,chars)):'')
+      const context=item.use_when?'适用 '+item.use_when+(item.avoid_when?.length?'，避用 '+item.avoid_when[0]:''):item.description
+      const candidate=item.asset_id+' '+(!allNeedLook&&item.needs_visual_check!==false?'待看 ':'')+JSON.stringify(clean(item.name,12))+(chars?' '+JSON.stringify(clean(context,chars)):'')
       if((heading+'\n'+[...lines,candidate].join('\n')+'\n'+suffix).length<=max_chars){line=candidate;break}
     }
     if(line)lines.push(line)

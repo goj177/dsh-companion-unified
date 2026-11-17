@@ -58,8 +58,15 @@ function send(res,status,value){res.writeHead(status,{'content-type':'applicatio
 const unavailable=message=>Object.assign(new Error(message||'此功能尚未就绪'),{httpStatus:503})
 const ownerContext={platform:'harness',conversation_id:'local-settings',owner_authorized:true,include_secret:false}
 
+async function snapshotPart(load,fallback){
+  let timer
+  try{
+    return await Promise.race([Promise.resolve().then(load),new Promise(resolve=>{timer=setTimeout(()=>resolve(fallback),4000)})])
+  }catch{return fallback}finally{clearTimeout(timer)}
+}
+
 export function createNativeAdminApi({store,profiles=new NativeProfileService({store}),memory=new NativeMemory(store),diary=new NativeDiary({store}),activity,hormone,learning_loop,consolidate_learning,tieba_atmosphere,persona_export,tieba_diagnostics,expression_evolution,reconcile_publication,
-  platforms={},people,people_detail,people_source,people_summarize,people_summary_enabled=()=>true,affinities,portability,connection,on_change,updates=new NativeUpdateChecker()}={}){
+  platforms={},people,people_detail,people_source,people_summarize,people_summary_enabled=()=>true,affinities,portability,school,model_default,connection,on_change,updates=new NativeUpdateChecker()}={}){
   if(!(store instanceof NativeStore))throw new Error('新版设置必须使用NativeStore')
   const ownerActivity=async()=>ownerActivityReports(store,activity?.status?await activity.status():{tasks:[],blocks:[],available:false})
   const snapshot=async()=>{
@@ -67,23 +74,37 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     for(const id of EDITABLE_DOCUMENTS){const row=store.getDocument(id);if(row)documents[id]=publicDocument(row)}
     const persona={}
     for(const platform of ['main',...PLATFORMS]){try{persona[platform]={own:profiles.ownProfile(platform),effective:profiles.resolve(platform)}}catch{persona[platform]={own:null,effective:null,error:'当前平台尚未配置人设'}}}
-    const platformStatus={}
-    for(const platform of PLATFORMS){
+    const platformReads=PLATFORMS.map(async platform=>{
       const service=platforms[platform]
-      try{platformStatus[platform]=service?.status?await service.status():{status:'unavailable',message:'平台服务尚未就绪'}}
-      catch{platformStatus[platform]={status:'error',message:'平台状态暂时无法读取'}}
-    }
-    const tasks=await ownerActivity()
+      const status=service?.status?await snapshotPart(()=>service.status(),{status:'error',reason:'平台状态读取未完成，请稍后刷新'}):{status:'unavailable',message:'平台服务尚未就绪'}
+      return [platform,status]
+    })
+    const [platformsReady,tasks]=await Promise.all([Promise.all(platformReads),snapshotPart(ownerActivity,{tasks:[],blocks:[],available:false})])
+    const platformStatus=Object.fromEntries(platformsReady)
     const budget=tasks.budget??null,mood=store.getDocument('mood')?.value.state??null
     let hormoneStatus=null
     try{if(typeof hormone?.status==='function')hormoneStatus=hormone.status()}catch{hormoneStatus={available:false}}
     return {ok:true,version:3,schema_version:3,documents,profiles:persona,updates:updates.status(),overview:{budget,mood,hormone:hormoneStatus,money_budget:tasks.money_budget??null,platforms:platformStatus},activity:tasks,
-      capabilities:{documents:!store.readOnly,profiles:!store.readOnly,rounds:{bilibili:!!activity?.runOneRound&&!store.readOnly,tieba:!!activity?.runOneRound&&!store.readOnly},
+      capabilities:{documents:!store.readOnly,profiles:!store.readOnly,qq_main_persona:!store.readOnly&&typeof profiles.setQQMainFollow==='function',rounds:{bilibili:!!activity?.runOneRound&&!store.readOnly,tieba:!!activity?.runOneRound&&!store.readOnly},
         memory:true,diary:true,update_check:true,persona_export:!!persona_export,tieba_diagnostics:!!tieba_diagnostics,expression_evolution:!!expression_evolution,daily_report:true,people:typeof people==='function',people_detail:typeof people_detail==='function',people_source:typeof people_source==='function',people_summary:typeof people_summarize==='function'&&!store.readOnly&&people_summary_enabled()===true,portability:!!portability,learning:{items:typeof learning_loop?.list==='function',manage:typeof learning_loop?.manage==='function'&&!store.readOnly,consolidate:typeof consolidate_learning==='function'&&!store.readOnly},
         authentication:Object.fromEntries(PLATFORMS.map(p=>[p,!!platforms[p]?.login&&!store.readOnly])),platform_actions:{bilibili:{check_inbox:!!platforms.bilibili?.checkInbox&&!store.readOnly,reconcile_today:!!platforms.bilibili?.reconcileToday&&!store.readOnly},tieba:{atmosphere:typeof tieba_atmosphere?.list==='function',check_inbox:!!platforms.tieba?.checkInbox&&!store.readOnly,inspect_page:!!platforms.tieba?.inspectPage&&!store.readOnly,check_private:!!platforms.tieba?.checkPrivate&&!store.readOnly}}}}
   }
   const handlers=new Map(),route=(method,path,handler)=>handlers.set(method+' '+NATIVE_ADMIN_BASE+path,handler)
   route('GET','/snapshot',()=>snapshot())
+  route('GET','/school',async()=>{if(!school)throw unavailable('托儿所尚未就绪');return {ok:true,...await school.status()}})
+  route('POST','/school',async req=>{
+    const body=await readBody(req);allowedKeys(body,body.operation==='configure'?['operation','enabled','interval_seconds']:['operation'])
+    if(!school)throw unavailable('托儿所尚未就绪')
+    if(body.operation==='enroll')return {ok:true,...await school.enroll()}
+    if(body.operation==='configure')return {ok:true,...await school.saveSettings({enabled:body.enabled,interval_seconds:body.interval_seconds})}
+    if(body.operation==='enable')return {ok:true,...await school.enable()}
+    if(body.operation==='run')return {ok:true,...await school.runNow()}
+    throw Error('托儿所操作无效')
+  })
+  route('GET','/model/default',()=>{
+    if(!model_default)throw unavailable('普通对话模型配置尚未就绪')
+    return {ok:true,...model_default.status()}
+  })
   route('POST','/updates/check',async(req)=>{const body=await readBody(req);allowedKeys(body,[]);return {ok:true,...await updates.check()}})
   route('POST','/expression/status',async req=>{const body=await readBody(req);allowedKeys(body,['platform']);if(!expression_evolution)throw unavailable('语风尚未就绪');return {ok:true,...expression_evolution.status(body,ownerContext),candidates:expression_evolution.candidates(body,ownerContext).items,config:store.getDocument('expression-evolution')??{revision:0,value:{enabled:true,auto_adopt:false}}}})
   route('POST','/expression/manage',async req=>{const body=await readBody(req);allowedKeys(body,['platform','operation','expected_revision','version','card_id']);if(!expression_evolution)throw unavailable('语风尚未就绪');return {ok:true,...expression_evolution.manage(body,ownerContext)}})
@@ -94,6 +115,13 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
   route('POST','/tieba/diagnostics',async req=>{const body=await readBody(req);allowedKeys(body,[]);if(!tieba_diagnostics)throw unavailable('自检尚未就绪');return {ok:true,...await tieba_diagnostics.check({},ownerContext)}})
   route('POST','/activity/report',async req=>{const body=await readBody(req);allowedKeys(body,['date','platform']);return {ok:true,...nativeOwnerDailyReport(store,body,ownerContext)}})
   route('GET','/activity',async()=>({ok:true,...await ownerActivity()}))
+  route('POST','/profiles/qq/follow-main',async req=>{
+    if(store.readOnly||typeof profiles.setQQMainFollow!=='function')throw unavailable('QQ 人设切换暂不可用')
+    const result=profiles.setQQMainFollow(await readBody(req),ownerContext)
+    if(result.changed)await on_change?.({profile_id:result.profile.id,platform:'qq',document_id:'qq',revision:result.document.revision})
+    return {ok:true,profile:result.profile,effective:result.effective,document:publicDocument(result.document),
+      message:result.effective.follow_main?'QQ 已启用主人设':'QQ 已切换到独立人设'}
+  })
   route('GET','/tieba/atmosphere',async(_req,url)=>{
     if([...url.searchParams.keys()].some(key=>key!=='bar'))throw new Error('吧内参考查询含未知字段')
     if(!tieba_atmosphere?.list||!tieba_atmosphere?.profile)throw unavailable('吧内参考暂时无法读取')
@@ -112,6 +140,7 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     if(id==='hormone'&&Object.keys(body.patch).some(key=>!['enabled','mode','policy'].includes(key)))throw new Error('精力和压力只能由真实活动变化，不能直接改写当前状态')
     if(id==='learning'&&Object.hasOwn(body.patch,'active_revision')||id==='learning-loop'&&Object.keys(body.patch).some(key=>!['enabled','policy'].includes(key)))throw new Error('学习版本、来源和使用记录由实际学习过程维护，不能通过设置改写')
     if(id==='qq'&&Object.hasOwn(body.patch.qq??{},'relationships'))throw new Error('QQ亲疏由欧鲸鲸自主决定，不能通过设置指定名单')
+    if(id==='qq'&&Object.hasOwn(body.patch.qq?.conversation??{},'workspace_id'))throw new Error('QQ 会话统一使用「欧鲸鲸的家」')
     const value=merge(old.value,body.patch),document=store.putDocument({id,type:old.type,value,expected_revision:body.expected_revision})
     const effect=await on_change?.({document_id:id,type:old.type,revision:document.revision})
     return {ok:true,document:publicDocument(document),restart_required:effect?.restart_required===true,message:effect?.message||'已保存'}
@@ -122,9 +151,9 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     return {ok:true,profile:result.profile,changed:result.changed,message:result.changed?'人设已保存，下次生成生效':'人设没有变化'}
   })
   route('POST','/rounds',async(req)=>{
-    const body=await readBody(req);allowedKeys(body,['platform','read_per_round','reply_per_round']);if(!['bilibili','tieba'].includes(body.platform))throw new Error('请选择B站或贴吧')
+    const body=await readBody(req);allowedKeys(body,['platform','read_per_round','reply_per_round','bar']);if(!['bilibili','tieba'].includes(body.platform))throw new Error('请选择B站或贴吧')
     if(!activity?.runOneRound)throw unavailable('活动执行器尚未就绪')
-    const result=await activity.runOneRound(body.platform,{trigger:'manual',...(body.read_per_round===undefined?{}:{read_per_round:body.read_per_round}),...(body.reply_per_round===undefined?{}:{reply_per_round:body.reply_per_round})})
+    const result=await activity.runOneRound(body.platform,{trigger:'manual',...(body.read_per_round===undefined?{}:{read_per_round:body.read_per_round}),...(body.reply_per_round===undefined?{}:{reply_per_round:body.reply_per_round}),...(body.bar===undefined?{}:{bar:body.bar})})
     const task=result.task??result
     return {ok:true,...result,task,duplicate:result.duplicate===true}
   })

@@ -28,6 +28,24 @@ export function splitChatId(chatId) {
     }
     return { kind: 'private', target: chatId };
 }
+/** Only exact private QQ IDs set by the owner are eligible as new contacts. */
+export function configuredProactiveQQContact(policy, conversation_id) {
+    return /^private:[1-9][0-9]{3,19}$/.test(conversation_id ?? '')
+        && (policy.idle?.qq_targets ?? []).includes('contact')
+        && conversation_id !== policy.qq?.owner_conversation
+        && (policy.qq?.private_conversations ?? []).includes(conversation_id);
+}
+export function qqProactiveTargets(policy) {
+    const candidates = new Map(), add = (target, conversation_id) => {
+        if (conversation_id && !candidates.has(conversation_id)) candidates.set(conversation_id, { target, conversation_id });
+    };
+    for (const target of policy.idle?.qq_targets ?? ['owner', 'group']) {
+        if (target === 'owner') add(target, policy.qq?.owner_conversation);
+        if (target === 'group') for (const id of policy.qq?.group_conversations ?? []) add(target, id);
+        if (target === 'contact') for (const id of policy.qq?.private_conversations ?? []) if (configuredProactiveQQContact(policy, id)) add(target, id);
+    }
+    return [...candidates.values()];
+}
 /**
  * Derive the durable session id for a chat: "onebot-<chatId>" with
  * non-alphanumerics flattened, so the session store key stays filesystem-safe
