@@ -1,6 +1,7 @@
 import './host-peers.mjs'
 import {openNativeInstallation} from './native/bootstrap.mjs'
 import {createNativeCore} from './native/core.mjs'
+import {migrateNativeHomeWorkspace} from './native/defaults.mjs'
 
 export const name='companion-unified'
 // The official headless bundle has no preset/workspace registry or web UI.
@@ -9,11 +10,13 @@ export const inject=['systemPrompt','tools','agents','sessions','agentDefaultMod
 
 /** One native lifecycle, one store, one client and one set of platform exits. */
 export async function apply(ctx,config={}){
-  if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>key!=='auditOnly')||config.auditOnly!==undefined&&typeof config.auditOnly!=='boolean')throw new Error('欧鲸鲸实例配置字段无效')
+  if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>!['auditOnly','hostFallback'].includes(key))||config.auditOnly!==undefined&&typeof config.auditOnly!=='boolean')throw new Error('欧鲸鲸实例配置字段无效')
   const installation=await openNativeInstallation()
   let core
   try{
-    core=createNativeCore(ctx,{store:installation.store,runtime_root:installation.runtime,audit_only:installation.audit_only||config.auditOnly===true})
+    const audit_only=installation.audit_only||config.auditOnly===true
+    if(!audit_only)migrateNativeHomeWorkspace(installation.store)
+    core=createNativeCore(ctx,{store:installation.store,runtime_root:installation.runtime,audit_only})
     await core.start()
   }catch(error){await core?.close();installation.store.close();throw error}
   let closing

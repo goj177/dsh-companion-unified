@@ -1,6 +1,6 @@
 {
   "name": "dsh-companion-unified",
-  "version": "3.5.21",
+  "version": "3.5.58",
   "description": "欧鲸鲸：原生统一记忆、按需学习、人设、心情与跨平台活动",
   "private": true,
   "type": "module",
@@ -28,6 +28,8 @@
     "portable-cli.mjs",
     "native/activity.mjs",
     "native/scheduled-rounds.mjs",
+    "native/school-schedule.mjs",
+    "native/school-visit.mjs",
     "native/activity-report.mjs",
     "native/admin-api.mjs",
     "native/asset-policy.mjs",
@@ -87,6 +89,7 @@
     "native/tieba-mentions.mjs",
     "native/tieba-replies.mjs",
     "native/tieba-incoming.mjs",
+    "native/tieba-encoded-text.mjs",
     "native/tieba.mjs",
     "native/tieba-content.mjs",
     "native/tieba-target.mjs",
@@ -122,6 +125,7 @@
     "native/expression-visual.mjs",
     "native/social-participation.mjs",
     "native/tieba-media-selection.mjs",
+    "native/expression-library.mjs",
     "native/persona-export.mjs",
     "native/tieba-diagnostics.mjs",
     "native/owner-reports.mjs",
@@ -165,9 +169,21 @@
   "scripts": {
     "build:client": "node scripts/build-client.mjs",
     "prepack": "node scripts/build-client.mjs",
-    "verify:public": "node scripts/verify-public-release.mjs",
+    "verify:input-query": "node scripts/verify-native-semantic-message-query.mjs && node scripts/verify-native-current-input-recall.mjs && node scripts/verify-native-memory-query.mjs",
     "verify:blank": "node scripts/verify-native-blank-initialization.mjs && node scripts/verify-native-defaults.mjs",
-    "verify:package": "node scripts/build-client.mjs --check && node scripts/verify-native-package.mjs"
+    "verify:package": "node scripts/build-client.mjs --check && node scripts/verify-native-package.mjs",
+    "verify:cli": "node scripts/verify-native-cli.mjs",
+    "verify:affect": "node scripts/verify-native-hormone.mjs && node scripts/verify-native-affect.mjs && node scripts/verify-native-hormone-portable.mjs",
+    "verify:learning": "node scripts/verify-native-learning-condition-matching.mjs && node scripts/verify-native-learning-loop.mjs && node scripts/verify-native-learning-runtime.mjs && node scripts/verify-native-learning-tools.mjs && node scripts/verify-native-memory-learning.mjs && node scripts/verify-native-learning-admin.mjs && node scripts/verify-native-learning-scheduler.mjs && node scripts/verify-native-learning-portable.mjs && node scripts/verify-native-source-context.mjs",
+    "verify:tieba-content": "node scripts/verify-native-tieba-content.mjs",
+    "verify:tieba-atmosphere": "node scripts/verify-native-tieba-atmosphere.mjs && node scripts/verify-native-tieba-content.mjs",
+    "verify:tieba-incoming": "node scripts/verify-native-tieba-low-information.mjs && node scripts/verify-native-tieba-attribution.mjs && node scripts/verify-native-tieba-peer-context.mjs && node scripts/verify-native-tieba-incoming-close.mjs",
+    "verify:token": "node scripts/verify-native-tool-scope.mjs && node scripts/verify-native-tieba-conversation.mjs && node scripts/verify-native-incoming-budget.mjs && node scripts/verify-native-idle-recovery.mjs && node scripts/verify-native-token-projections.mjs && node scripts/verify-native-tieba-sub-limit.mjs",
+    "verify:update": "node scripts/verify-native-update-check.mjs",
+    "verify:memory-idle": "node scripts/verify-native-memory-consolidation.mjs && node scripts/verify-native-memory-provenance.mjs && node scripts/verify-native-memory-consumption.mjs && node scripts/verify-native-memory-idle-integration.mjs && node scripts/verify-native-memory-source-read-policy.mjs && node scripts/verify-native-memory-idle-priority.mjs",
+    "verify:reply-token": "node scripts/verify-native-tool-schema.mjs && node scripts/verify-native-read-result-projection.mjs && node scripts/verify-native-read-record-view.mjs && node scripts/verify-native-action-projection.mjs && node scripts/verify-native-task-prompt.mjs && node scripts/verify-native-incoming-action-capability.mjs && node scripts/verify-native-incoming-tool-scope.mjs",
+    "verify:tieba-publication": "node scripts/verify-native-tieba-reply-length.mjs && node scripts/verify-native-tieba-post-receipt.mjs && node scripts/verify-native-tieba-web-receipt.mjs",
+    "verify:tieba-media": "node scripts/verify-native-tieba-media.mjs"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
