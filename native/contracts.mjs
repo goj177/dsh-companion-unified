@@ -155,6 +155,7 @@ const qqSettings = object({
 
 const tiebaSettings = object({
   bars: array(string(160), 1000), keywords: array(string(240), 1000),
+  proactive_post_bars: array(string(160,{nonempty:true}), 1000),
   ignored_reply_bars: array(string(160,{nonempty:true}), 1000),
   reply_pauses: array(object({ actor_uid: uid, until: timestamp, skip_before: timestamp, reason: string(2000) }, ['actor_uid','until']), 1000),
   thread_reply_pauses: array(object({ thread_id: uid, until: timestamp, skip_before: timestamp, reason: string(2000) }, ['thread_id','until','skip_before']), 1000),
@@ -162,6 +163,7 @@ const tiebaSettings = object({
     sub_reply: boolean, new_thread: boolean, images: boolean, experimental_image_post: boolean, direct_message:boolean }),
   inbox:object({enabled:boolean,poll_interval_ms:integer(15000),seed_on_start:boolean,allow_legacy_auth:boolean,auth_until:nullable(timestamp),authorized_peer_uids:array(uid,100),daily_limit:integer(1,500),gap_ms:integer(1000)}),
   comment_inbox:object({enabled:boolean,poll_interval_ms:integer(15000),seed_on_start:boolean,max_pages:integer(1,30)}),
+  reply_context:object({peer_history_limit:integer(0,10),nearby_reply_limit:integer(0,10)}),
   limits: object({ read_per_round: integer(), reply_per_round: integer(), reply_per_day: integer(), sub_reply_per_round: integer(),
     sub_reply_per_day: integer(), new_thread_per_day: integer(), image_per_day: integer(), reply_gap_ms: integer() }),
   requests: object({ gap_ms: integer(), breaker_ms: integer(), dedupe_days: integer() }),
@@ -244,6 +246,9 @@ const learningItem=object({id:string(80),kind:choice('meme','phrase','habit'),st
   versions:array(object({revision:integer(),status:learningItemStatus,content:learningContent,evidence_ids:array(string(160),4),at:timestamp},['revision','status','content','evidence_ids','at']),8),
 },['id','kind','status','revision','content','evidence_ids','source_kind','visibility','platform','conversation_id','created_at','updated_at','used','positive','negative','last_used_at','last_offered_at','versions'])
 const learningHash=string(64,{pattern:/^[a-f0-9]{64}$/})
+const replyLearning=object({
+  action_id:identifier, request_digest:learningHash, body_digest:learningHash, server_id:string(160,{nonempty:true}),
+},['action_id','request_digest','body_digest','server_id'])
 const learningLoopState=object({version:choice(1),revision:integer(),updated_at:timestamp,
   reviews:array(object({evidence_id:string(160),attempts:integer(),retry_after:timestamp,completed_at:timestamp,status:choice('queued','done','skipped','failed'),last_task_id:string(240)},['evidence_id','attempts','retry_after','completed_at','status','last_task_id']),3000),
   offers:array(object({id:string(80),card_id:string(160),card_revision:integer(),context_hash:learningHash,session_hash:learningHash,platform,at:timestamp,query_hash:learningHash,task_id:string(240),source_scope:string(512)},['id','card_id','card_revision','context_hash','session_hash','platform','at','query_hash','task_id','source_scope']),200),
@@ -325,7 +330,8 @@ const gameWikiCatalog = object({
 
 export const DOCUMENT_CONTRACTS = freeze(Object.fromEntries(Object.entries({
   settings, activity, activity_state: activityState, mood, hormone, hormone_state:hormoneState, platform_settings: providerSettings,
-  platform_state: platformState, quota, inbox, learning, learning_state: learningState, learning_loop:learningLoop,learning_loop_state:learningLoopState,learning_item:learningItem,speech, speech_state:speechState,qq_participation_state:qqParticipationState,
+  platform_state: platformState, quota, inbox, learning, learning_state: learningState, learning_loop:learningLoop,learning_loop_state:learningLoopState,learning_item:learningItem,reply_learning:replyLearning,speech, speech_state:speechState,qq_participation_state:qqParticipationState,
+  // Legacy settings and snapshots remain readable for existing stores and backups.
   expression_evolution:expressionEvolution,expression_voice:expressionVoice,
   traffic_state:trafficState, session_policy: sessionPolicy, conversation_binding: conversationBinding, bilibili_inbox_state:bilibiliInboxState,tieba_inbox_state:tiebaInboxState,tieba_reply_inbox_state:tiebaReplyInboxState,
   tieba_style_library: tiebaStyleLibrary, tieba_bar_styles: tiebaBarStyles,tieba_atmosphere:tiebaAtmosphere,

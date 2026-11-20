@@ -5,6 +5,13 @@ import {canonicalBar} from './tieba-atmosphere.mjs'
 const hash=value=>createHash('sha256').update(value).digest('hex')
 const comment=action=>action.kind==='tieba.reply'||action.platform==='bilibili'&&(['bilibili.comment','bilibili.reply'].includes(action.kind)&&!['dm','live'].includes(action.target.channel)&&action.target.via!=='dm'||action.kind==='bilibili.share'&&action.target.via==='comment')
 
+export function proactiveTiebaPostBars(config){
+  if(config?.permissions?.new_thread!==true)return []
+  const names=values=>(Array.isArray(values)?values:[]).flatMap(value=>{try{return [canonicalBar(value)]}catch{return []}})
+  const selected=new Set(names(config.proactive_post_bars))
+  return [...new Set(names(config.bars))].filter(bar=>selected.has(bar))
+}
+
 /** Per-browse-round limits. Incoming notifications and individual replies do not
  * become browse rounds; settings, manual rounds and autonomous rounds share it. */
 export class NativeRoundPolicy{
@@ -14,6 +21,25 @@ export class NativeRoundPolicy{
   active(scope=''){return !!scope&&!!this.store.db.prepare('SELECT id FROM journal_events WHERE event_key=?').get(this._key(scope))}
   bar(scope=''){const row=scope?this.store.db.prepare('SELECT metadata_json FROM journal_events WHERE event_key=?').get(this._key(scope)):null;return row?JSON.parse(row.metadata_json).bar??'':''}
   assertBar(scope,bar){const required=this.bar(scope);if(required&&(!bar||canonicalBar(bar)!==required))throw new Error('本轮仅允许访问指定贴吧，目标吧身份不符或尚未核验')}
+  isTiebaExplore(scope=''){
+    if(!scope||this.platform!=='tieba')return false
+    const row=this.store.db.prepare('SELECT metadata_json FROM journal_events WHERE event_key=?').get(this._key(scope))
+    const metadata=row?JSON.parse(row.metadata_json):{}
+    if(metadata.explore===true||metadata.bar)return true
+    return !!this.store.db.prepare("SELECT 1 FROM actions WHERE platform='tieba' AND kind='activity.explore' AND json_extract(metadata_json,'$.batch_id')=? LIMIT 1").get(scope)
+  }
+  assertTiebaTopic(scope,bar){
+    if(!this.isTiebaExplore(scope))return
+    this.assertBar(scope,bar)
+    if(!proactiveTiebaPostBars(this.settings()).includes(canonicalBar(bar)))throw new Error('目标吧未加入「允许主动发帖的吧」，本轮不能在这里开新帖')
+  }
+  assertFocusedReply(scope,{kind,target,body},verifiedBar){
+    if(!this.bar(scope))return
+    if(kind!=='tieba.reply'||!this.hasRead(scope,target.thread_id))throw new Error('指定贴吧轮次只允许在指定吧开帖或回复本轮已读帖子')
+    this.assertBar(scope,target.bar)
+    this.assertBar(scope,verifiedBar)
+    this.assertNotCancelled(scope,target,body)
+  }
   markRead(scope,resource_id,bar){if(!this.bar(scope))return;this.assertBar(scope,bar);if(!this.state(scope).ids.includes(resource_id))throw new Error('帖子不属于本轮浏览');this.store.transaction(()=>{const event_key=this._key(scope)+':read:'+hash(resource_id);if(!this.store.db.prepare('SELECT 1 FROM journal_events WHERE event_key=?').get(event_key))this.store.appendJournalEvent({event_key,event_type:'log',platform:this.platform,direction:'internal',status:'recorded',visibility:'owner',text:'',source_at:this.now(),source_type:'native_round_policy',metadata:{subtype:'browse_item_read',round_id:scope,resource_id,bar}})})}
   hasRead(scope,resource_id){return !!this.store.db.prepare('SELECT 1 FROM journal_events WHERE event_key=?').get(this._key(scope)+':read:'+hash(resource_id))}
   assertNotCancelled(scope,target,body){if(!this.bar(scope))return;const normal=value=>String(value??'').normalize('NFKC').replace(/\s+/gu,' ').trim();const candidate=normal(body);if(!candidate)return;const rows=this.store.db.prepare("SELECT CAST(body AS BLOB) bytes FROM actions WHERE platform='tieba' AND kind='tieba.reply' AND status='cancelled' AND json_extract(target_json,'$.thread_id')=?").all(target.thread_id??'');if(rows.some(row=>normal(Buffer.from(row.bytes).toString('utf8'))===candidate))throw new Error('该帖相同回复已被取消，不能重新发送')}
@@ -22,7 +48,7 @@ export class NativeRoundPolicy{
     if(!scope)return;this._scope(scope)
     let limits=this.limits();const bar=options.bar===undefined?'':canonicalBar(options.bar);if(bar&&this.platform!=='tieba')throw new Error('指定吧名仅支持贴吧')
     if(options.limits!==undefined){const input=options.limits;if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(key=>!['read_per_round','reply_per_round','sub_reply_per_round'].includes(key)))throw new Error('本轮覆盖字段无效');for(const [key,value]of Object.entries(input))if(!Number.isSafeInteger(value)||value<(key==='read_per_round'?1:0)||value>30)throw new Error('本轮浏览须为1至30、评论须为0至30');const base=this.limits();limits={read:input.read_per_round??base.read,reply:input.reply_per_round??base.reply,sub_reply:input.sub_reply_per_round??base.sub_reply}}
-    this.store.transaction(()=>{if(this.active(scope)){if(options.limits!==undefined&&JSON.stringify(this.limits(scope))!==JSON.stringify(limits))throw new Error('已经开始的同一轮不能改变覆盖数量');if(bar&&this.bar(scope)!==bar)throw new Error('已经开始的同一轮不能改变目标贴吧');return}this.store.appendJournalEvent({event_key:this._key(scope),event_type:'log',platform:this.platform,direction:'internal',status:'recorded',visibility:'owner',text:'',source_at:this.now(),source_type:'native_round_policy',metadata:{subtype:'browse_round_started',round_id:scope,limits,...(bar?{bar}:{})}})})
+    this.store.transaction(()=>{if(this.active(scope)){if(options.limits!==undefined&&JSON.stringify(this.limits(scope))!==JSON.stringify(limits))throw new Error('已经开始的同一轮不能改变覆盖数量');if(bar&&this.bar(scope)!==bar)throw new Error('已经开始的同一轮不能改变目标贴吧');return}this.store.appendJournalEvent({event_key:this._key(scope),event_type:'log',platform:this.platform,direction:'internal',status:'recorded',visibility:'owner',text:'',source_at:this.now(),source_type:'native_round_policy',metadata:{subtype:'browse_round_started',round_id:scope,limits,...(bar?{bar}:{}),...(options.explore===true?{explore:true}:{})}})})
   }
   state(scope=''){this._scope(scope);const rows=scope?this.store.db.prepare("SELECT metadata_json FROM journal_events WHERE platform=? AND json_extract(metadata_json,'$.subtype') IN ('browse_item_reserved','browse_item_failed') AND json_extract(metadata_json,'$.round_id')=?").all(this.platform,scope).map(row=>JSON.parse(row.metadata_json)):[],ids=rows.filter(row=>row.subtype==='browse_item_reserved').map(row=>row.resource_id),failed_ids=rows.filter(row=>row.subtype==='browse_item_failed').map(row=>row.resource_id),limit=this.limits(scope).read;return {limit,ids,failed_ids,used:ids.filter(id=>!failed_ids.includes(id)).length,attempt_limit:this.platform==='bilibili'?limit*2:limit}}
   reserve(resource_id,scope=''){

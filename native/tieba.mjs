@@ -40,7 +40,8 @@ const publicationErrorInfo=error=>{
  const names=new Set(['Error','TypeError','RangeError','SyntaxError','AbortError','TimeoutError','TiebaError','TiebaTransportError']),codes=new Set(['invalid_response','read_failed','verification_required','risk_pause','account_changed','invalid_action_lease','permission_denied','participation_paused','disabled','closed','authentication_required','tieba_transport_failed','tieba_transport_aborted','tieba_transport_response_invalid','tieba_transport_size_limit','tieba_transport_not_started','ECONNRESET','ETIMEDOUT','EPIPE','ECONNABORTED','ENOTFOUND','EAI_AGAIN','UND_ERR_SOCKET','UND_ERR_CONNECT_TIMEOUT','SQLITE_BUSY','ERR_INVALID_STATE','ERR_STREAM_PREMATURE_CLOSE'])
  const name=names.has(error?.name)?error.name:'Error',raw=error?.code,code=codes.has(raw)?raw:Number.isSafeInteger(raw)?String(raw):typeof raw==='string'?'other:'+sha(raw).slice(0,12):'',locations=[]
  for(const match of (typeof error?.stack==='string'?error.stack:'').matchAll(/\/native\/(tieba(?:-media|-curl|-app-media)?|outbox|run-scope)\.mjs:(\d{1,8}):(\d{1,8})/g)){const location=match[1]+'.mjs:'+match[2]+':'+match[3];if(!locations.includes(location))locations.push(location);if(locations.length===3)break}
- return{name,code,locations}
+ const server_code=Number.isSafeInteger(error?.server_code)?error.server_code:null
+ return{name,code,locations,...(server_code!==null?{server_code}:{})}
 }
 const attributionAliases={source_id:'row.post_id ?? row.sub_reply_id',current_speaker_uid:'row.author_uid',author_name:'row.name',first_person_owner_uid:'row.author_uid'}
 /** Compact only the model-facing read. With same_as_row=true, omitted
@@ -629,7 +630,16 @@ export class NativeTieba{
       const cfg=this._settings().config,target=action.target,bar=barName(target.bar),body=text(action.body,3000),publication=['tieba.reply','tieba.post'].includes(action.kind),sub=!!target.post_id||!!target.sub_reply_id,images=target.asset_ids??[]
       const checkBarIgnore=()=>{if(action.kind==='tieba.reply'&&tiebaBarRepliesIgnored(this._settings().config,bar))throw new TiebaError('主人已永久忽略此吧来信，已跳过回复','permission_denied')}
       checkBarIgnore()
-      if(this.rounds.bar(roundScope)){if(action.kind!=='tieba.reply'||!this.rounds.hasRead(roundScope,target.thread_id))throw new TiebaError('指定贴吧轮次只允许回复本轮已读帖子','permission_denied');try{this.rounds.assertBar(roundScope,bar);this.rounds.assertBar(roundScope,this._knownForum(target.thread_id));this.rounds.assertNotCancelled(roundScope,target,body)}catch{throw new TiebaError('指定贴吧轮次目标吧未核验，或相同回复已被取消','permission_denied')}}
+      const checkTopic=()=>{
+        if(action.kind!=='tieba.post')return
+        if(this._settings().config.permissions?.new_thread!==true)throw new TiebaError('当前设置未允许发新帖','permission_denied')
+        try{this.rounds.assertTiebaTopic(roundScope,bar)}catch(error){throw new TiebaError(error.message,'permission_denied')}
+      }
+      checkTopic()
+      if(action.kind!=='tieba.post'&&this.rounds.bar(roundScope)){
+        try{this.rounds.assertFocusedReply(roundScope,{kind:action.kind,target,body},action.kind==='tieba.reply'?this._knownForum(target.thread_id):undefined)}
+        catch(error){throw new TiebaError(error.message,'permission_denied')}
+      }
       let emotes;try{emotes=checkedTiebaEmotes(target.emotes??[])}catch(error){throw new TiebaError(error.message,'invalid_input')}
       if(publication)try{assertTiebaPublishableBody(body,emotes,{reply:action.kind==='tieba.reply'})}catch(error){throw new TiebaError(error.message,'invalid_input')}
       const allowed=action.kind==='tieba.post'?cfg.permissions?.new_thread:action.kind==='tieba.reply'?cfg.permissions?.reply:action.kind==='tieba.sign'?cfg.permissions?.sign:cfg.permissions?.follow
@@ -661,7 +671,7 @@ export class NativeTieba{
       const checkReplyPause=()=>{checkBarIgnore();const source=checkIncomingDecision();if(action.kind==='tieba.reply'&&(tiebaThreadReplyPaused(this._settings().config,target.thread_id,this._now(),source?.source_at??(sub?thread_reply_source_at:action.created_at),{unknown_source_blocks:true})||tiebaThreadReplyPaused(this._settings().config,target.thread_id,this._now(),action.created_at,{unknown_source_blocks:true})))throw new TiebaError('主人已暂停回复此帖；暂停期间旧消息不补回','permission_denied');if(source&&this.participation?.paused({platform:'tieba',...source}))throw new TiebaError('当前来信已选择暂不接话','participation_paused');if(action.kind==='tieba.reply'&&tiebaReplyPaused(this._settings().config,resolved?.uid??target.reply_uid,this._now(),reply_source_at))throw new TiebaError('主人已临时暂停回复此贴吧账号','permission_denied')}
       checkReplyPause()
       if(images.length){if(!this.assets?.read)throw new TiebaError('原生图片仓库尚未接入','invalid_asset');let asset;try{asset=await abortableRun(this.assets.read(text(images[0],160)),scope)}catch{this._assertRun(scope);throw new TiebaError('配图素材无法读取：引用未登记或文件校验失败，请重新从素材列表选择','invalid_asset')}this._assertRun(scope);if(!/^image\/(?:png|jpeg|gif|webp)$/.test(asset.media_type)||asset.bytes.length>2*1024*1024)throw new TiebaError('贴吧图片类型或容量不符合原图床限制','invalid_asset');if(!canPublishAsset(asset,{platform:'tieba',bar}))throw new TiebaError('图片未获本吧发表许可','invalid_asset');const entries=(asset.manifest.catalog_entries??[]).filter(row=>row.historical!==true&&['tieba_images','shared_stickers'].includes(row.collection));let last=Math.max(0,...entries.map(row=>row.last_used_at??0));for(const row of this.store.db.prepare("SELECT source_at FROM journal_events WHERE platform='tieba' AND json_extract(metadata_json,'$.subtype')='image_upload_attempt' AND json_extract(metadata_json,'$.asset_id')=?").all(asset.id))last=Math.max(last,row.source_at??0);if(last&&this._now()-last<86400000)throw new TiebaError('这张图片仍在24小时使用冷却内','minimum_gap');const high=this._highWater('image',shanghaiTime(this._now()).date);if(high.used>=(cfg.limits?.image_per_day??10))throw new TiebaError('贴吧图片当天额度已用完','daily_limit');image=asset}
-      const onWrite=async()=>{this._assertRun(scope);checkReplyPause();checkReplyIntent();const row=this.store.db.prepare('SELECT status,request_digest,metadata_json FROM actions WHERE id=?').get(action.id),metadata=row?JSON.parse(row.metadata_json):{};if(!row||!['leased','submitting'].includes(row.status)||row.request_digest!==action.request_digest||metadata.lease_until<=this._now())throw new TiebaError('贴吧发表租约已结束','invalid_action_lease');if(this._settings().value.credential_ref!==credentialRef||sha((await this._credential()).header)!==sha(cred.header))throw new TiebaError('账号登录态已变化，原动作未继续发送','account_changed');this._assertRun(scope);checkReplyPause();checkReplyIntent();if(!marked){if(publication)this._reserveAction(action,sub,image?1:0,roundScope);await mark_network_started();this._assertRun(scope);const checked=this.store.db.prepare('SELECT status,metadata_json FROM actions WHERE id=?').get(action.id),meta=checked?JSON.parse(checked.metadata_json):{};if(checked?.status!=='submitting'||meta.network_started!==true||meta.lease_until<=this._now())throw new TiebaError('原生发表开始状态未持久确认或已过期','invalid_action_lease');marked=true}}
+      const onWrite=async()=>{this._assertRun(scope);checkReplyPause();checkReplyIntent();const row=this.store.db.prepare('SELECT status,request_digest,metadata_json FROM actions WHERE id=?').get(action.id),metadata=row?JSON.parse(row.metadata_json):{};if(!row||!['leased','submitting'].includes(row.status)||row.request_digest!==action.request_digest||metadata.lease_until<=this._now())throw new TiebaError('贴吧发表租约已结束','invalid_action_lease');if(this._settings().value.credential_ref!==credentialRef||sha((await this._credential()).header)!==sha(cred.header))throw new TiebaError('账号登录态已变化，原动作未继续发送','account_changed');this._assertRun(scope);checkReplyPause();checkReplyIntent();checkTopic();if(!marked){if(publication)this._reserveAction(action,sub,image?1:0,roundScope);await mark_network_started();this._assertRun(scope);const checked=this.store.db.prepare('SELECT status,metadata_json FROM actions WHERE id=?').get(action.id),meta=checked?JSON.parse(checked.metadata_json):{};if(checked?.status!=='submitting'||meta.network_started!==true||meta.lease_until<=this._now())throw new TiebaError('原生发表开始状态未持久确认或已过期','invalid_action_lease');marked=true}}
       const publicationBody=child_id||profile_id?stripTiebaReplyPrefix(body,resolved.name):body
       if(action.kind==='tieba.reply'&&!publicationBody.trim()&&!emotes.length&&!image)throw new TiebaError('回复正文为空，请填写引用之后的正文','invalid_input')
       let replyPrefix=''
@@ -756,6 +766,11 @@ export class NativeTieba{
       const row=action?.id?this.store.db.prepare('SELECT metadata_json FROM actions WHERE id=?').get(action.id):null,metadata=row?JSON.parse(row.metadata_json):{}
       if(metadata.network_started)marked=true
       if(!marked&&error instanceof TiebaError&&error.code==='minimum_gap')return {...result('not_started',error.message),not_before:error.not_before??this._now()+(this._settings().config.limits?.reply_gap_ms??30000)}
+      if(!marked&&action.kind==='tieba.reply'&&error instanceof TiebaError&&error.code==='read_failed'){
+        const attempts=metadata.attempts??1
+        if(attempts>=3)return result('blocked','贴吧楼层多次无法核验，已停止自动发送并保留原稿')
+        return {...result('not_started','贴吧发送前楼层无法核验，原回复延后重试'),not_before:this._now()+120000*2**Math.max(0,attempts-1)}
+      }
       if(!marked&&error?.code==='tieba_transport_aborted'&&!scope?.signal?.aborted){
         // The exact original may be retried, but it must give other queued replies time to run.
         const delay=Math.min(300000,60000*2**Math.max(1,(metadata.attempts??1)-1))

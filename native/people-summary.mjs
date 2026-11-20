@@ -7,6 +7,7 @@ import {NativePeople} from './people.mjs'
 import {NativeProfileService} from './profile-service.mjs'
 import {fields,identifier,redactText} from './memory-rules.mjs'
 import {valleyDecision} from '../policy.mjs'
+import {PEOPLE_SUMMARY_FORMAT,PEOPLE_SUMMARY_LIMITS} from './task-prompt.mjs'
 const parse=value=>{try{return JSON.parse(value??'{}')}catch{return{}}}
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value
 const hash=value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(canonical(value))).digest('hex')
@@ -14,13 +15,14 @@ const owner={platform:'harness',owner_authorized:true,include_secret:false,visib
 const requireOwner=context=>{if(context?.owner_authorized!==true||context.platform!=='harness'||context.visibility==='public')throw Error('人物总结仅限主人本机设置')}
 const clip=(value,max)=>{const text=redactText(String(value??'')).replace(/\0/g,' ');let end=Math.min(text.length,max);if(end>0&&/[\uD800-\uDBFF]/.test(text[end-1])&&/[\uDC00-\uDFFF]/.test(text[end]??''))end--;return text.slice(0,end)}
 const active=new Set(['queued','leased','running'])
+const narratesAsCompanion=text=>/(?:我|本鱼|本鲸)/u.test(text.replace(/“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"|\x60[^\x60]*\x60/gu,''))
 export class NativePeopleSummary{
  constructor({store,people,profiles,activity,read_source,now=store?.now,issue_task,background_capability}={}){
   if(!(store instanceof NativeStore)||!(people instanceof NativePeople)||people.store!==store||typeof read_source!=='function'||typeof now!=='function'||issue_task!==undefined&&typeof issue_task!=='function'||background_capability===null||background_capability!==undefined&&!['object','symbol'].includes(typeof background_capability))throw Error('人物总结需要同库熟人服务、来源读取与宿主能力')
   this.store=store;this.people=people;this.profiles=profiles??new NativeProfileService({store});if(this.profiles.store!==store)throw Error('人物总结与人设必须使用同一原生库');this.activity=activity;this.readSource=read_source;this.now=now;this.issueTask=issue_task;this.capability=background_capability
  }
  _now(){const value=this.now();if(!Number.isSafeInteger(value)||value<0)throw Error('人物总结时钟无效');return value}
- _profile(){const p=this.profiles.resolve('main');return hash({id:p.source_profile_id??p.id,name:p.name,self_ref:p.self_ref,owner_address:p.owner_address,body_md:p.body_md,traits:p.traits,voice:p.voice})}
+ _profile(){const p=this.profiles.resolve('main');return hash({summary_format:PEOPLE_SUMMARY_FORMAT,id:p.source_profile_id??p.id,name:p.name,self_ref:p.self_ref,owner_address:p.owner_address,body_md:p.body_md,traits:p.traits,voice:p.voice})}
  _pack(entity_id){return this.people.withOwnerDetailSnapshot(()=>this._packSnapshot(entity_id))}
  _packSnapshot(entity_id){
   const detail=this.people.ownerDetail({entity_id,event_limit:10},owner)
@@ -79,7 +81,7 @@ export class NativePeopleSummary{
   if(!cached)return result
   const {saved,pack:cachedPack}=cached,value=saved.metadata.result
   result.cached=true;result.summary={...summary,generated_at:saved.source_at,journal_id:saved.id}
-  const render=(item,event=false,index=0)=>{const sources=[...new Map(item.basis.map(source=>[key(source),{kind:source.kind,id:source.id}])).values()],records=item.basis.map(source=>cachedPack.records.find(row=>key(row)===key(source))),times=records.filter(row=>row.role==='event').map(row=>row.occurred_at).filter(time=>Number.isSafeInteger(time)&&time>0);return{id:saved.id+':'+(event?'event:'+index:'impression'),text:item.text,label:event?'近期互动':'大肥鱼的印象',kind:event?'ai_event_summary':'ai_impression',author:'memory',platform:new Set(records.map(row=>row.platform)).size===1?records[0]?.platform??'':'',...(event?{occurred_at:times.length?Math.max(...times):null}:{at:saved.source_at}),sources,evidence_ids:sources.filter(source=>source.kind==='evidence').map(source=>source.id),source_ref:'',verification:'companion_summary',verification_label:event?'大肥鱼根据记录写的互动总结':'大肥鱼根据相处记录写的主观印象'}}
+  const render=(item,event=false,index=0)=>{const sources=[...new Map(item.basis.map(source=>[key(source),{kind:source.kind,id:source.id}])).values()],records=item.basis.map(source=>cachedPack.records.find(row=>key(row)===key(source))),times=records.filter(row=>row.role==='event').map(row=>row.occurred_at).filter(time=>Number.isSafeInteger(time)&&time>0);return{id:saved.id+':'+(event?'event:'+index:'impression'),text:item.text,label:event?'近期互动':'大肥鱼的印象',kind:event?'ai_event_summary':'ai_impression',author:'companion',platform:new Set(records.map(row=>row.platform)).size===1?records[0]?.platform??'':'',...(event?{occurred_at:times.length?Math.max(...times):null}:{at:saved.source_at}),sources,evidence_ids:sources.filter(source=>source.kind==='evidence').map(source=>source.id),source_ref:'',verification:'companion_summary',verification_label:event?'大肥鱼根据记录写的互动总结':'大肥鱼根据相处记录写的主观印象'}}
   if(value.impression.text)result.impressions=[render(value.impression)]
   result.recent_events=value.recent_events.slice(0,limit).map((item,index)=>render(item,true,index))
   return result
@@ -106,7 +108,7 @@ export class NativePeopleSummary{
   if(this.store.getDocument('settings')?.value.enabled===false||this.store.getDocument('activity')?.value.enabled!==true||typeof this.issueTask!=='function'||!this.activity?.enqueue)return{queued:false}
   const policy=this.store.getDocument('activity').value,budget=this.activity.budget.status()
   if(!valleyDecision(this._now(),policy).valley)return{queued:false,status:'peak'}
-  if(budget.autonomous_wakes>=budget.daily_wake_limit||budget.tokens+budget.reserved_tokens+7000>budget.daily_token_limit)return{queued:false,status:'budget'}
+  if(budget.autonomous_wakes>=budget.daily_wake_limit)return{queued:false,status:'budget'}
   if(this.store.db.prepare("SELECT 1 FROM actions WHERE kind='activity.maintenance' AND json_extract(target_json,'$.maintenance_kind')='people' AND status IN ('queued','leased','running') LIMIT 1").get())return{queued:false,status:'pending'}
   const cutoff=this._now()-86400000,candidates=this.store.db.prepare("SELECT entity_id,MAX(at) last_at FROM (SELECT COALESCE(e.actor_entity_id,p.entity_id) entity_id,e.recorded_at at FROM evidence e LEFT JOIN platform_identities p ON p.namespace=e.platform AND p.platform_uid=e.actor_uid WHERE e.direction='in' AND e.source_type='user' AND e.recorded_at>=? AND e.actor_uid<>'' UNION ALL SELECT r.object_id entity_id,a.confirmed_at at FROM actions a JOIN relations r ON r.subject_kind='action' AND r.subject_id=a.id AND r.relation='directed_to' AND r.object_kind='entity' WHERE a.status='confirmed' AND a.confirmed_at>=?) WHERE entity_id IS NOT NULL GROUP BY entity_id ORDER BY last_at DESC LIMIT 40").all(cutoff,cutoff)
   const profile=this._profile();this.autoSkipped??=new Set();let checked=0
@@ -148,7 +150,7 @@ export class NativePeopleSummary{
   fields(input,['impression','recent_events'],'人物总结结果');const {row,target,metadata,pack,batch_id}=this._trusted(null,trusted)
   if(metadata.model_started!==true)throw Error('人物总结需要本轮真实模型已开始处理')
   if(typeof trusted.session_id!=='string'||!trusted.session_id)throw Error('人物总结需要当前真实SDK会话')
-  const validate=(item,event=false)=>{fields(item,['text','basis'],'人物总结条目');if(typeof item.text!=='string'||!item.text.isWellFormed()||item.text.includes('\0')||item.text.length>(event?240:360)||redactText(item.text)!==item.text||!Array.isArray(item.basis)||item.basis.length>4)throw Error('人物总结文字或引用格式无效');const text=item.text.trim();if(!text){if(item.basis.length)throw Error('空总结不能伪造引用');return{text:'',basis:[]}}if(!item.basis.length)throw Error('每条人物总结都需要本轮原文依据')
+  const validate=(item,event=false)=>{fields(item,['text','basis'],'人物总结条目');if(typeof item.text!=='string'||!item.text.isWellFormed()||item.text.includes('\0')||item.text.length>(event?PEOPLE_SUMMARY_LIMITS.event:PEOPLE_SUMMARY_LIMITS.impression)||redactText(item.text)!==item.text||!Array.isArray(item.basis)||item.basis.length>4)throw Error('人物总结文字或引用格式无效');const text=item.text.trim();if(!text){if(item.basis.length)throw Error('空总结不能伪造引用');return{text:'',basis:[]}}if(!narratesAsCompanion(text))throw Error('请用大肥鱼自己的第一人称写印象与近况，引用中的“我”不算');if(!item.basis.length)throw Error('每条人物总结都需要本轮原文依据')
    const basis=item.basis.map(source=>{fields(source,['kind','id','quote'],'人物总结原文引用');if(!types.has(source.kind)||typeof source.id!=='string'||typeof source.quote!=='string'||!source.quote.trim()||source.quote.length>240)throw Error('人物总结引用范围无效');const record=pack.records.find(row=>key(row)===key(source));if(!record||!record.text.includes(source.quote))throw Error('人物总结引用不属于本轮已读取原文');return{kind:source.kind,id:source.id,quote:source.quote}})
    if(event&&!basis.some(source=>pack.records.find(row=>key(row)===key(source))?.role==='event'))throw Error('近期互动必须引用本轮真实互动，不能把旧印象改成事件')
    if(/(?:确诊|患有).{0,8}(?:抑郁症|精神病|人格障碍)|(?:猜|推测|肯定|一定).{0,8}(?:性取向|宗教|民族|政治立场)/.test(text))throw Error('人物印象不能推断身份或作心理诊断')
@@ -158,7 +160,7 @@ export class NativePeopleSummary{
   const recent_events=events.map(item=>validate(item,true)).filter(item=>item.text),result={impression,recent_events},event_key='people-summary:'+row.id
   return this.store.transaction(()=>{const previous=this.store.db.prepare('SELECT id,metadata_json FROM journal_events WHERE event_key=?').get(event_key);if(previous){if(hash(parse(previous.metadata_json).result)!==hash(result))throw Error('这次任务已保存不同总结，保留原结果');return{ok:true,written:true,duplicate:true,entity_id:target.entity_id,journal_id:previous.id,model_calls:0}}
    this._trusted(null,trusted)
-   const event=this.store.appendJournalEvent({event_key,event_type:'learning',platform:'harness',entity_id:target.entity_id,direction:'internal',status:'recorded',visibility:'owner',text:'',source_at:this._now(),source_type:'native_people_summary',metadata:{subtype:'people_summary',schema_version:2,entity_id:target.entity_id,task_id:row.id,batch_id,session_id:trusted.session_id,source_fingerprint:pack.fingerprint,profile_hash:pack.profile_hash,source_refs:pack.records.map(({kind,id,source_hash,role,platform,occurred_at})=>({kind,id,source_hash,role,platform,occurred_at})),result,model_generated:true,subjective_impression:true,independent_fact_verification:false,no_publication:true}})
+   const event=this.store.appendJournalEvent({event_key,event_type:'learning',platform:'harness',entity_id:target.entity_id,direction:'internal',status:'recorded',visibility:'owner',text:'',source_at:this._now(),source_type:'native_people_summary',metadata:{subtype:'people_summary',schema_version:PEOPLE_SUMMARY_FORMAT,entity_id:target.entity_id,task_id:row.id,batch_id,session_id:trusted.session_id,source_fingerprint:pack.fingerprint,profile_hash:pack.profile_hash,source_refs:pack.records.map(({kind,id,source_hash,role,platform,occurred_at})=>({kind,id,source_hash,role,platform,occurred_at})),result,model_generated:true,subjective_impression:true,independent_fact_verification:false,no_publication:true}})
    return{ok:true,written:true,entity_id:target.entity_id,journal_id:event.id,model_calls:0}
   })
  }

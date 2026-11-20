@@ -24,7 +24,7 @@ const short=(value,limit)=>{if(value===undefined||value===null)return '';if(type
  * hooks bind real SDK sources, apply monotonic execution guards and assemble
  * stable persona plus a small task-related context. */
 export function installNativeRuntimeHooks(ctx,options={}){
-  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','affect','speech','references','learning','expression','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','maintenance_guard','tool_profile','on_image_viewed','now','register_memory_tools','register_profile_tool','register_image_tool','channel_model'])
+  fields(options,['store','profiles','people','memory_runtime','qq','activity','session_runner','money_budget','mood','affect','speech','references','learning','social','host_context_resolver','persona_resolver','qq_current_authority','qq_moderation_authority','qq_moderation_lookup_authority','qq_management_authority','maintenance_guard','tool_profile','on_image_viewed','now','register_memory_tools','register_profile_tool','register_image_tool','channel_model'])
   const {store,profiles,memory_runtime:memory,qq,session_runner:runner}=options
   if(!(store instanceof NativeStore)||!(profiles instanceof NativeProfileService)||!(memory instanceof NativeMemoryRuntime)||profiles.store!==store||memory.store!==store)throw new Error('运行钩子必须使用同一NativeStore的原生人设和记忆服务')
   if(options.host_context_resolver!==undefined&&typeof options.host_context_resolver!=='function')throw new Error('host_context_resolver必须为可信宿主函数')
@@ -81,8 +81,8 @@ export function installNativeRuntimeHooks(ctx,options={}){
       if(runner?.task(sidOf(agent))?.study_closing)lines.push('【本轮收尾】本轮已取得11帖真实阅读来源，并已有原生发表动作。现在只用一句简短自然的话结束，不再浏览、学习或调用工具。已准备动作仍走原发表队列；未确认的动作不能声称已发表。')
       if(activePersona(agent)!==null&&!resolved.memory_only&&!sourceReview(agent)&&runner?.task(sidOf(agent))?.maintenance_kind!=='people'){
         if(options.people?.context){const familiar=Object.fromEntries(['session_id','workspace_id','platform','conversation_id','actor_uid','actor_entity_id','owner_authorized','include_secret','read_memory'].filter(key=>resolved[key]!==undefined).map(key=>[key,resolved[key]]));familiar.public_summary_enabled=store.getDocument('settings')?.value.familiarity?.public_summary_enabled===true;lines.push(short(options.people.context(familiar),180))}
-        const learned=learning('context',input)??'',voice=optional(options.expression,'context',input)??'',expression=voice&&learned.length+voice.length+1<=1000?[learned,voice].filter(Boolean).join('\n'):learned
-        lines.push(short(affect('context',input)??optional(options.mood,'context',input),240),short(optional(options.references,'context',input),360),short(optional(options.speech,'context',input),120),short(expression,1000),short(optional(options.social,'context',input),380))
+        const learned=learning('context',input)??''
+        lines.push(short(affect('context',input)??optional(options.mood,'context',input),240),short(optional(options.references,'context',input),360),short(optional(options.speech,'context',input),120),short(learned,1000),short(optional(options.social,'context',input),380))
       }
       if(runner?.task(sidOf(agent)))lines.push(runner?.task(sidOf(agent))?.maintenance_kind==='people'?'【当前任务】仅整理本轮人物资料，逐字标明依据；只提交闭门摘要，不联系任何人。':resolved.memory_only?'【当前任务】仅整理给定少量证据；推断待确认，不联系任何人。':sourceReview(agent)?'【当前任务】按原始来源归纳用法与场景，不把自己的口头禅或人设套成各吧的表达；没有新收获就跳过。':'【当前活动】只做本轮相关的一件事；开口接具体内容，不写内部工作报告。')
       const complete=[];let used=0
@@ -200,7 +200,8 @@ export function installNativeRuntimeHooks(ctx,options={}){
       if(task.maintenance_kind==='people'&&task.people_summary_written===true&&task.input_bound&&task.user_committed&&task.model_started&&runner.controller?.get(sid)===agent){task.people_summary_closed=true;task.stop_reason='本轮熟人印象已记录，闭门整理结束';return {kind:'reject'}}
       if(runner.incomingClosed?.(agent,{turn,step}))return {kind:'reject'}
       const heavy=task.batch.tasks.some(item=>item.metadata?.heavy!==false),limit=task.maintenance_kind==='people'?Math.min(task.batch.model?.max_steps??3,3):task.batch.model?.max_steps??p.budget?.max_steps??8
-      if(signal?.aborted||messages.length>0&&!task.input_bound||task.blocked||task.unknown||step>limit||task.total_tokens>=(p.budget?.max_task_tokens??30000)||heavy&&task.batch.trigger!=='manual'&&!valleyDecision(now(),p).valley){task.stop_reason=step>limit?'本轮已达到步骤上限，停止追加模型调用':task.total_tokens>=(p.budget?.max_task_tokens??30000)?'本轮已达到token保护上限，停止追加模型调用':'本轮已按运行门禁停止，已准备动作以各自回执为准';return {kind:'reject'}}
+      const tokenLimitReached=task.maintenance_kind!=='people'&&task.total_tokens>=(p.budget?.max_task_tokens??30000)
+      if(signal?.aborted||messages.length>0&&!task.input_bound||task.blocked||task.unknown||step>limit||tokenLimitReached||heavy&&task.batch.trigger!=='manual'&&!valleyDecision(now(),p).valley){task.stop_reason=step>limit?'本轮已达到步骤上限，停止追加模型调用':tokenLimitReached?'本轮已达到token保护上限，停止追加模型调用':'本轮已按运行门禁停止，已准备动作以各自回执为准';return {kind:'reject'}}
     }
     const decision=await next()
     if(decision?.kind!=='enter'||signal?.aborted)return decision
@@ -212,8 +213,9 @@ export function installNativeRuntimeHooks(ctx,options={}){
     runner?.onRequest(payload.agent,payload);options.money_budget?.onRequest(payload)
     affect('request',payload.agent,payload)
     const request=await next(),task=runner?.task(sidOf(payload.agent)),resolved=context({agent:payload.agent}),p=policy()
+    if(task?.maintenance_kind==='people')return request
     if(!task&&!['qq','tieba','bilibili'].includes(resolved.platform))return options.money_budget?.enabled()?{...request,maxTokens:Math.min(request.maxTokens??32768,32768)}:request
-    const peak=!valleyDecision(now(),p).valley,output=task?.maintenance_kind==='people'?Math.min(task.batch.model?.max_output_tokens??1600,1600):resolved.memory_only?1200:task?.batch.model?.max_output_tokens??(peak?p.model?.peak_max_output_tokens??900:p.model?.max_output_tokens??1800)
+    const peak=!valleyDecision(now(),p).valley,output=resolved.memory_only?1200:task?.batch.model?.max_output_tokens??(peak?p.model?.peak_max_output_tokens??900:p.model?.max_output_tokens??1800)
     const closing=task?.study_closing===true
     const maxTokens=Math.min(request.maxTokens??Infinity,output,closing?768:Infinity)
     return {...request,maxTokens}

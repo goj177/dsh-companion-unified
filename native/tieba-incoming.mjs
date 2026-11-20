@@ -60,8 +60,14 @@ export function tiebaMentionLabels(row,mentioned_uids,self_uid){
   }
   return labels
 }
-export function publicTiebaPeerContext(store,{actor_uid,self_uid,conversation_id,exclude_evidence_id='',max_chars=1000,before_at=null,include_public_name=false}={}){
-  if(!/^[1-9]\d*$/.test(actor_uid??'')||!/^[1-9]\d*$/.test(self_uid??'')||actor_uid===self_uid)return null
+export function tiebaReplyContextLimits(store){
+  const id=store.getDocument('settings')?.value.platform_document_ids?.tieba??'tieba'
+  const config=store.getDocument(id)?.value.tieba?.reply_context
+  return {peer_history_limit:config?.peer_history_limit??3,nearby_reply_limit:config?.nearby_reply_limit??4}
+}
+
+export function publicTiebaPeerContext(store,{actor_uid,self_uid,conversation_id,exclude_evidence_id='',history_limit=tiebaReplyContextLimits(store).peer_history_limit,max_chars=Math.max(1000,history_limit*330),before_at=null,include_public_name=false}={}){
+  if(history_limit===0||!/^[1-9]\d*$/.test(actor_uid??'')||!/^[1-9]\d*$/.test(self_uid??'')||actor_uid===self_uid)return null
   const identity=store.getPlatformIdentity('tieba',actor_uid);if(!identity||identity.role==='account')return null
   const entity=store.db.prepare("SELECT short_ref FROM entities WHERE id=? AND kind='person'").get(identity.entity_id),current=peerConversation(conversation_id),current_thread=current?.thread_id??'',current_parent=current?.parent_post_id??'',conversation=String(conversation_id??''),records=[],key=id=>String(id??'').replace(/^reply:/,'')
   const incoming=store.db.prepare("SELECT id,conversation_id,source_message_id,source_at,recorded_at,text,json_extract(source_json,'$.nickname') nickname FROM evidence WHERE platform='tieba' AND actor_uid=? AND direction='in' AND source_type='user' AND visibility='public' AND status IN ('confirmed','pending','uncertain') AND id<>? AND (actor_entity_id IS NULL OR actor_entity_id=?) AND json_extract(source_json,'$.kind') IN ('user','human','user_statement') AND (? IS NULL OR source_at<?) ORDER BY CASE WHEN conversation_id=? THEN 0 ELSE 1 END,source_at DESC,recorded_at DESC LIMIT 40").all(actor_uid,exclude_evidence_id,identity.entity_id,before_at,before_at,conversation).filter(row=>peerConversation(row.conversation_id)&&/^[1-9]\d*$/.test(key(row.source_message_id)))
@@ -78,7 +84,7 @@ export function publicTiebaPeerContext(store,{actor_uid,self_uid,conversation_id
     records.push({conversation_id:'thread:'+target.thread_id+(parent?':'+parent:''),recorded_at:row.confirmed_at,fact:{thread_id:target.thread_id,parent_post_id:parent||null,source_id:receipt.server_id,author_uid:self_uid,author_role:'account_self',reply_to_uid:actor_uid,text:row.body.slice(0,120).toWellFormed(),...(row.body.length>120?{text_truncated:true,total_chars:row.body.length}:{}),source_at,verification:'server_receipt'}})
   }
   records.sort((a,b)=>Number(b.conversation_id===conversation)-Number(a.conversation_id===conversation)||peerTime(b)-peerTime(a)||(b.recorded_at??0)-(a.recorded_at??0))
-  const selected=[],seen=new Set();for(const row of records){const key=row.fact.thread_id+':'+row.fact.source_id;if(seen.has(key))continue;seen.add(key);selected.push(row);if(selected.length===3)break}
+  const selected=[],seen=new Set();for(const row of records){const key=row.fact.thread_id+':'+row.fact.source_id;if(seen.has(key))continue;seen.add(key);selected.push(row);if(selected.length===history_limit)break}
   const public_name=include_public_name?incoming.map(row=>mentionLabel(row.nickname)).find(Boolean):''
   const result={uid:actor_uid,entity_ref:entity?.short_ref??identity.entity_id,known_before:incoming.length>0||records.length>0,seen_in_other_threads:incoming.some(row=>peerConversation(row.conversation_id).thread_id!==current_thread)||records.some(row=>row.fact.thread_id!==current_thread),recent_public_dialogue:selected.map(row=>row.fact),...(public_name?{public_name}:{})}
   while(selected.length&&JSON.stringify(result).length>max_chars){selected.pop();result.recent_public_dialogue=selected.map(row=>row.fact)}
@@ -92,7 +98,7 @@ function mentionedTiebaPeople(store,context,source,self_uid){
   for(const uid of source_context.mentioned_uids){
     if(typeof uid!=='string'||!/^[1-9]\d*$/.test(uid)||seen.has(uid))continue
     seen.add(uid)
-    const peer=publicTiebaPeerContext(store,{actor_uid:uid,self_uid,conversation_id:source.conversation_id,before_at:source.source_at,include_public_name:true,max_chars:900})
+    const peer=publicTiebaPeerContext(store,{actor_uid:uid,self_uid,conversation_id:source.conversation_id,before_at:source.source_at,include_public_name:true,history_limit:3,max_chars:900})
     const mention_text=mentionLabel(Array.isArray(mention_labels)?mention_labels.find(label=>label?.uid===uid)?.text:'')
     people.push({uid,...(mention_text?{mention_text}:peer?.public_name?{public_name:peer.public_name}:{}),known_before:peer?.known_before??false,seen_in_other_threads:peer?.seen_in_other_threads??false,recent_public_dialogue:(peer?.recent_public_dialogue??[]).map(fact=>fact.author_uid===uid?{...fact,author_role:'mentioned_person'}:fact)})
     if(people.length===4)break
@@ -103,6 +109,7 @@ function mentionedTiebaPeople(store,context,source,self_uid){
 /** Refresh a model-only view when a queued notification predates the current context format. Stored evidence remains unchanged. */
 export function currentTiebaIncomingView(store,batch,self_uid){
   if(batch.platform!=='tieba'||batch.kind!=='activity.incoming'||!/^[1-9]\d*$/.test(self_uid??''))return batch
+  const {peer_history_limit,nearby_reply_limit}=tiebaReplyContextLimits(store)
   const tasks=batch.tasks.map(task=>{
     let envelope;try{envelope=JSON.parse(task.metadata?.public_context??'null')}catch{return task}
     const source=task.source_evidence_id?store.db.prepare("SELECT actor_uid,conversation_id,text,source_at FROM evidence WHERE id=? AND platform='tieba' AND direction='in' AND source_type='user' AND visibility='public'").get(task.source_evidence_id):null
@@ -120,7 +127,12 @@ export function currentTiebaIncomingView(store,batch,self_uid){
       return reply_to_uid?{...record,reply_to_uid,recipient_verification:'confirmed_local_receipt'}:record
     })}
     const identity=store.getPlatformIdentity('tieba',source.actor_uid);context.speaker={uid:source.actor_uid,name:identity?.display_name??'',role:'counterpart'};delete context.peer_context
-    const peer=publicTiebaPeerContext(store,{actor_uid:source.actor_uid,self_uid,conversation_id:source.conversation_id,exclude_evidence_id:task.source_evidence_id});if(peer)context.peer_context=peer
+    const peer=publicTiebaPeerContext(store,{actor_uid:source.actor_uid,self_uid,conversation_id:source.conversation_id,exclude_evidence_id:task.source_evidence_id,history_limit:peer_history_limit});if(peer)context.peer_context=peer
+    if(Array.isArray(context.nearby_context?.records)){
+      const records=context.nearby_context.records
+      if(!nearby_reply_limit)delete context.nearby_context
+      else context.nearby_context={...context.nearby_context,records:records.slice(Math.max(0,records.length-nearby_reply_limit))}
+    }
     const mentioned=mentionedTiebaPeople(store,context,source,self_uid);delete context.mention_labels;delete context.mentioned_people
     if(mentioned.length)context.mentioned_people=mentioned
     const pack=()=>JSON.stringify({...context,...(public_image_sources.length?{public_image_sources}:{})})
