@@ -64,7 +64,7 @@ function quietDecision(now,config){
  * public-send implementation exists in this module. */
 export class NativeActivity {
   constructor(options={}){
-    fields(options,['store','budget','money_budget','runner','publication_runner','model_gate','background_model','now','activity_document_id','state_document_id','dsh_model'])
+    fields(options,['store','budget','money_budget','runner','publication_runner','model_gate','background_model','token_budget_exempt','now','activity_document_id','state_document_id','dsh_model'])
     if(!(options.store instanceof NativeStore))throw new Error('NativeActivity必须显式使用NativeStore')
     if(options.now!==undefined&&typeof options.now!=='function'||options.runner!==undefined&&typeof options.runner!=='function'||options.publication_runner!==undefined&&typeof options.publication_runner!=='function'||options.model_gate!==undefined&&typeof options.model_gate!=='function'||options.background_model!==undefined&&typeof options.background_model!=='function')throw new Error('活动时钟、准入检查或runner必须为函数')
     this.store=options.store;this.now=options.now??this.store.now;this.policy_id=text(options.activity_document_id??'activity','activity_document_id',160,true)
@@ -72,6 +72,8 @@ export class NativeActivity {
     this.budget=options.budget??new NativeBudget({store:this.store,now:this.now,policy_document_id:this.policy_id})
     if(!(this.budget instanceof NativeBudget)||this.budget.store!==this.store||this.budget.policyId!==this.policy_id)throw new Error('NativeActivity预算必须使用同一个NativeStore和活动策略')
     if(options.dsh_model!==undefined&&typeof options.dsh_model!=='function')throw new Error('DSH 模型选择必须由宿主提供')
+    if(options.token_budget_exempt!==undefined&&typeof options.token_budget_exempt!=='function')throw new Error('Token 预算例外必须由可信宿主提供')
+    this.token_budget_exempt=options.token_budget_exempt
     this.runner=options.runner;this.publication_runner=options.publication_runner;this.model_gate=options.model_gate;this.background_model=options.background_model;this.money=options.money_budget;this.dsh_model=options.dsh_model;if(this.money&&this.money.store!==this.store)throw new Error('费用预算必须同库')
   }
   moneyBudgetEnabled(){return this.money?.enabled()===true&&(!this.dsh_model||isMoneyBudgetProvider(this.dsh_model()?.provider))}
@@ -411,7 +413,7 @@ export class NativeActivity {
         const batch_id='activity-batch:'+randomUUID(),lease_token=randomUUID(),now=this._now(),lease_until=now+(p.batching?.lease_ms??900000)
         let reservation=null
         if(!publication){
-          reservation=this.budget.reserve({id:batch_id,platform:first.platform,kind:first.kind,estimated_tokens,human:first.metadata.human,heavy:first.metadata.heavy,manual:first.metadata.trigger==='manual',trigger:first.metadata.trigger})
+          reservation=this.budget.reserve({id:batch_id,platform:first.platform,kind:first.kind,estimated_tokens,human:first.metadata.human,heavy:first.metadata.heavy,manual:first.metadata.trigger==='manual',trigger:first.metadata.trigger,token_exempt:this.token_budget_exempt?.(first)===true})
           if(!reservation.allowed){denied=reservation;if(reservation.reason==='task_reservation_too_large')this._finishInvalid(first,'任务预留超出单轮上限','blocked');continue}
         }
         for(const task of tasks){
@@ -549,7 +551,11 @@ export class NativeActivity {
       else if(task.status==='blocked')gate={reason:'platform_blocked',next_eligible_at:this._block(state,task.platform)?.until??null}
       else if(task.status==='draft')gate={reason:'approval_required',next_eligible_at:null}
       else gate={reason:task.status,next_eligible_at:null}
-      if(gate.reason==='ready'&&task.metadata.execution==='model'&&(task.metadata.trigger==='autonomous'&&budget.autonomous_wakes>=budget.daily_wake_limit||task.metadata.trigger!=='manual'&&budget.tokens+budget.reserved_tokens+task.metadata.estimated_tokens>budget.daily_token_limit))gate={reason:'budget',next_eligible_at:shanghaiTime(now).midnight+86400000}
+      if(gate.reason==='ready'&&task.metadata.execution==='model'){
+        const wakeLimit=task.metadata.trigger==='autonomous'&&budget.autonomous_wakes>=budget.daily_wake_limit
+        const tokenLimit=task.metadata.trigger!=='manual'&&this.token_budget_exempt?.(task)!==true&&budget.tokens+budget.reserved_tokens+task.metadata.estimated_tokens>budget.daily_token_limit
+        if(wakeLimit||tokenLimit)gate={reason:'budget',next_eligible_at:shanghaiTime(now).midnight+86400000}
+      }
       const display_status=gate.reason==='platform_blocked'?'blocked':ACTIVE.includes(task.status)?'running':task.status
       return {id:task.id,platform:task.platform,kind:task.kind,status:task.status,display_status,execution:task.metadata.execution,trigger:task.metadata.trigger,created_at:task.created_at,updated_at:task.updated_at,not_before:task.not_before,batch_id:task.metadata.batch_id??'',...(task.target.round_limits?{round_limits:{...task.target.round_limits}}:{}),reason:task.metadata.last_error||gate.reason,next_eligible_at:gate.next_eligible_at}
     })

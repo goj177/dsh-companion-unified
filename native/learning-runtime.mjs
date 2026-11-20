@@ -25,9 +25,9 @@ function feedbackTone(text){
 /** The durable loop owns cards and bookkeeping. This adapter supplies real
  * consumed sources, actual prompt boundaries and confirmed output ownership. */
 export class NativeLearningRuntime{
-  constructor({store,loop,legacy,memory,now=Date.now,enabled=()=>true,resolve_context=()=>({}),get_task=()=>null}={}){
+  constructor({store,loop,legacy,memory,reply_learning,now=Date.now,enabled=()=>true,resolve_context=()=>({}),get_task=()=>null}={}){
     if(!(store instanceof NativeStore)||!loop||typeof now!=='function'||typeof enabled!=='function'||typeof resolve_context!=='function'||typeof get_task!=='function')throw new Error('学习运行时需要同库引擎和可信来源回调')
-    Object.assign(this,{store,loop,legacy,memory,now,enabled,resolveContext:resolve_context,getTask:get_task});this.turns=new Map();this.previews=new Map();this.closed=false;this.last_error=''
+    Object.assign(this,{store,loop,legacy,memory,reply_learning,now,enabled,resolveContext:resolve_context,getTask:get_task});this.turns=new Map();this.previews=new Map();this.closed=false;this.last_error=''
   }
   _enabled(){return !this.closed&&!this.store.readOnly&&this.enabled()&&this.store.getDocument('settings')?.value.enabled!==false}
   _context(agent,fallback={}){try{return {...fallback,...this.resolveContext({agent})}}catch{return {...fallback}}}
@@ -111,7 +111,8 @@ export class NativeLearningRuntime{
     const sid=sidOf(input.agent),task=this.getTask(sid)
     if(this.closed||this.store.getDocument('settings')?.value.enabled===false||this.store.getDocument('learning')?.value.enabled===false||this.store.getDocument('learning-loop')?.value.enabled===false||input.context?.memory_only||task?.maintenance_kind){this.previews.delete(sid);return ''}
     const state=this.turns.get(sid),trusted=this._context(input.agent,{...input.context,session_id:sid}),query=this._query(state,trusted),selection=this.loop.select({query,scene:'当前自然对话'},trusted)
-    let line=selection.context
+    const example=this.reply_learning?this._attempt(()=>this.reply_learning.reference({query},trusted)):''
+    let line=[selection.context,example].filter(Boolean).join('\n')
     if(!line&&teaching(query))line='【本轮学习】若要学当前梗或说法，先用companion_learning sources取已消费的真实来源，再learn填写含义、适用与避用、正反例和原文片段；结果只算试用，不能自称已验证会用。'
     // General conversation has no reason to carry the top interests on every
     // turn. They are useful only when choosing an autonomous exploration.

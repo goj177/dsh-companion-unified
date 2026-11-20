@@ -136,9 +136,20 @@ export class NativeSocial {
     if(metadata.trigger==='manual')return
     if(!hasContextualTiebaReplyDecision(this.store,{incoming_task_id:row.id,task_id:context.task_id,session_id:context.session_id??'',source_evidence_id:row.source_evidence_id}))throw new Error('请先根据上下文确认实际谈话对象是自己，并为这条来信选择reply，才可准备发表')
   }
+  _tiebaRound(){
+    return new NativeRoundPolicy({store:this.store,platform:'tieba',now:this.now})
+  }
+  _checkRound(round,scope,action){
+    if(action.kind==='tieba.post')return round.assertTiebaTopic(scope,action.target.bar)
+    if(round.bar(scope))round.assertFocusedReply(scope,action,action.kind==='tieba.reply'?this.providers.tieba?._knownForum?.(action.target.thread_id):undefined)
+  }
   async prepare(input,trusted_context={}){
     const result=await this._prepare(input,trusted_context)
-    if(result.duplicate&&trusted_context.round_id&&new NativeRoundPolicy({store:this.store,platform:'tieba',now:this.now}).bar(trusted_context.round_id)&&result.action.metadata?.prepared_in?.round_id!==trusted_context.round_id)throw new Error('指定贴吧轮次不能复用其他轮次的动作')
+    const scope=trusted_context.round_id??trusted_context.task_id
+    if(result.duplicate&&scope&&result.action.metadata?.prepared_in?.round_id!==scope){
+      const round=this._tiebaRound()
+      if(round.bar(scope)||input.kind==='tieba.post'&&round.isTiebaExplore(scope))throw new Error('本轮发帖或指定吧操作不能复用其他轮次的动作')
+    }
     if(!result.duplicate&&input.kind==='qq.send'&&trusted_context.can_manage_qq&&input.target.conversation_id!==trusted_context.conversation_id){
       if(!this.providers.qq.managementAuthority(trusted_context,result.action.target))throw new Error('当前管理员群发授权已失效')
       this.store.transaction(()=>{const action=this.outbox.get(result.action.id,{internal:true}),source=Object.fromEntries(['platform','conversation_id','session_id','actor_uid','source_scope'].map(key=>[key,trusted_context[key]]));this.store.db.prepare('UPDATE actions SET metadata_json=? WHERE id=?').run(JSON.stringify({...action.metadata,qq_management:source}),action.id)})
@@ -164,8 +175,9 @@ export class NativeSocial {
     if(input.kind==='bilibili.share'&&!['qq','comment','dynamic','dm','live'].includes(input.target.via))throw new Error('B站分享渠道无效：via只能为qq、comment、dynamic、dm或live；分享给主人请用via=qq、destination=owner')
     if(input.kind==='bilibili.reply'&&!['comment','dm','live'].includes(input.target.channel??'comment'))throw new Error('B站回复渠道无效：channel只能为comment、dm或live；回复评论可省略channel')
     const platform=this._authorize(input.kind,input.target,trusted_context),provider=this.providers[platform]
-    const boundRound=trusted_context.round_id&&new NativeRoundPolicy({store:this.store,platform:'tieba',now:this.now}),boundBar=boundRound&&boundRound.bar(trusted_context.round_id)
-    if(boundBar){if(platform!=='tieba'||input.kind!=='tieba.reply'||!boundRound.hasRead(trusted_context.round_id,input.target.thread_id))throw new Error('指定贴吧轮次只允许回复本轮已读帖子');boundRound.assertBar(trusted_context.round_id,input.target.bar);boundRound.assertBar(trusted_context.round_id,provider?._knownForum?.(input.target.thread_id));boundRound.assertNotCancelled(trusted_context.round_id,input.target,input.body)}
+    const scope=trusted_context.round_id??trusted_context.task_id,round=this._tiebaRound()
+    if(input.kind==='tieba.post'&&trusted_context.autonomous===true&&!round.isTiebaExplore(scope))throw new Error('只有贴吧浏览轮次可以自主发新帖')
+    this._checkRound(round,scope,input)
     this._requireIncomingDecision(input.kind,input.target,trusted_context)
     if(!provider)throw new Error(PLATFORM_LABEL[platform]+'执行器尚未就绪')
     if(platform==='tieba'&&input.kind!=='tieba.message'){assertTiebaActionTarget(input.kind,input.target);checkedTiebaEmotes(input.target.emotes??[])}
@@ -219,8 +231,8 @@ export class NativeSocial {
     return this.store.transaction(()=>{
       const action=this.outbox.get(action_id,{internal:true});if(!action)throw new Error('草稿不存在')
       this._authorize(action.kind,action.target,trusted_context)
-      const boundRound=action.metadata?.prepared_in?.round_id&&new NativeRoundPolicy({store:this.store,platform:'tieba',now:this.now}),scope=action.metadata?.prepared_in?.round_id
-      if(boundRound?.bar(scope)){if(action.kind!=='tieba.reply'||!boundRound.hasRead(scope,action.target.thread_id))throw new Error('指定贴吧轮次只允许回复本轮已读帖子');boundRound.assertBar(scope,action.target.bar);boundRound.assertBar(scope,this.providers.tieba?._knownForum?.(action.target.thread_id));boundRound.assertNotCancelled(scope,action.target,action.body)}
+      const scope=action.metadata?.prepared_in?.round_id,round=this._tiebaRound()
+      this._checkRound(round,scope,action)
       if(action.status==='draft'&&['tieba','bilibili'].includes(action.platform))new NativeRoundPolicy({store:this.store,platform:action.platform,now:this.now}).checkApproval(action)
       return this.outbox.approve(action_id,{expected_digest})
     })

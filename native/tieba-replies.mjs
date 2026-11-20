@@ -7,7 +7,7 @@ import {redactText} from './memory-rules.mjs'
 import {publicSourceContext,explicitSourceReplyUid} from './source-context.mjs'
 import {tiebaBarRepliesIgnored,tiebaReplyPaused,tiebaThreadReplyPaused} from './tieba-target.mjs'
 import {packTiebaIncomingImageContext} from './tieba-vision.mjs'
-import {lowInformationTiebaReply,tiebaContextRecord,tiebaMentionLabels,publicTiebaPeerContext,verifiedTiebaSelfRecipient} from './tieba-incoming.mjs'
+import {lowInformationTiebaReply,tiebaContextRecord,tiebaMentionLabels,publicTiebaPeerContext,tiebaReplyContextLimits,verifiedTiebaSelfRecipient} from './tieba-incoming.mjs'
 
 const hash=value=>createHash('sha256').update(value).digest('hex')
 const str=bytes=>{try{return new TextDecoder('utf-8',{fatal:true}).decode(bytes)}catch{throw new TiebaError('回复通知文字编码无法核验','invalid_response')}}
@@ -89,9 +89,10 @@ export class NativeTiebaReplies{
     const source_context={...publicSourceContext({platform:'tieba',source_kind:row.is_sub_reply?'comment_reply':'topic_comment',self_uid,topic_author_uid,author_uid:row.actor.uid,parent_author_uid,reply_to_uid,mentioned_uids:mentions,text}),addressed_to_self:addressed,address_kind:addressed?'account_self':thirdParty?'third_party':'unknown',recipient_verification,notification_relation}
     const mention_labels=tiebaMentionLabels(current,source_context.mentioned_uids,self_uid)
     const seen=new Set([row.reply_id,...records.map(record=>record.source_id)])
-    const nearby=children.filter(item=>earlier(item.source_at,item.post_id))
+    const {nearby_reply_limit}=tiebaReplyContextLimits(this.store)
+    const nearby=nearby_reply_limit===0?[]:children.filter(item=>earlier(item.source_at,item.post_id))
       .sort((a,b)=>a.source_at-b.source_at||(BigInt(a.post_id)<BigInt(b.post_id)?-1:BigInt(a.post_id)>BigInt(b.post_id)?1:0))
-      .filter(item=>{if(seen.has(item.post_id))return false;seen.add(item.post_id);return true}).slice(-4).map(item=>contextRecord(item,200)).filter(Boolean)
+      .filter(item=>{if(seen.has(item.post_id))return false;seen.add(item.post_id);return true}).slice(-nearby_reply_limit).map(item=>contextRecord(item,200)).filter(Boolean)
     const public_image_sources=s.imageSources?.(current,{thread_id:row.thread_id,...(row.is_sub_reply?{post_id:target.post_id}:{})})??[]
     if(public_image_sources.some(source=>source.source_message_id!==row.reply_id||source.author_uid!==row.actor.uid))throw new TiebaError('图片原楼ID或作者与已核验通知不一致','target_not_resolved')
     return {target,text,source_context,mention_labels,speaker:{uid:row.actor.uid,name:row.actor.name,role:'counterpart'},quoted_context:{records:records.slice(0,2),authority:'quoted_public_source'},nearby_context:{records:nearby,authority:'public_same_floor'},public_image_sources}

@@ -6,6 +6,7 @@ import { NativeMemory } from './memory.mjs'
 import { NativeDiary } from './diary.mjs'
 import { isPlainObject, validateJson } from './contracts.mjs'
 import {NativeUpdateChecker} from './update-check.mjs'
+import {canonicalBar} from './tieba-atmosphere.mjs'
 
 export const NATIVE_ADMIN_BASE='/api/companion/v3'
 const PLATFORMS=['qq','bilibili','tieba']
@@ -25,6 +26,20 @@ function merge(base,patch){
     next[key]=isPlainObject(value)?merge(isPlainObject(next[key])?next[key]:{},value):clone(value)
   }
   return next
+}
+function syncTiebaProactivePostBars(settings,patch){
+  if(!isPlainObject(patch)||!Array.isArray(settings?.proactive_post_bars))return
+  const changesSelection=Object.hasOwn(patch,'proactive_post_bars')
+  if(!changesSelection&&!Object.hasOwn(patch,'bars'))return
+  const bars=settings.bars??[]
+  if(!Array.isArray(bars))return
+  const allowed=new Set()
+  for(const bar of bars){try{allowed.add(canonicalBar(bar))}catch{}}
+  const valid=settings.proactive_post_bars.filter(bar=>{
+    try{return allowed.has(canonicalBar(bar))}catch{return false}
+  })
+  if(changesSelection&&valid.length!==settings.proactive_post_bars.length)throw new Error('允许主动发帖的吧只能从常逛的吧中选择')
+  if(!changesSelection)settings.proactive_post_bars=valid
 }
 function publicDocument(row){
   if(!row)return null
@@ -65,10 +80,10 @@ async function snapshotPart(load,fallback){
   }catch{return fallback}finally{clearTimeout(timer)}
 }
 
-export function createNativeAdminApi({store,profiles=new NativeProfileService({store}),memory=new NativeMemory(store),diary=new NativeDiary({store}),activity,hormone,learning_loop,consolidate_learning,tieba_atmosphere,persona_export,tieba_diagnostics,expression_evolution,reconcile_publication,
+export function createNativeAdminApi({store,profiles=new NativeProfileService({store}),memory=new NativeMemory(store),diary=new NativeDiary({store}),activity,hormone,learning_loop,reply_learning,consolidate_learning,tieba_atmosphere,persona_export,tieba_diagnostics,reconcile_publication,
   platforms={},people,people_detail,people_source,people_summarize,people_summary_enabled=()=>true,affinities,portability,school,model_default,connection,on_change,updates=new NativeUpdateChecker()}={}){
   if(!(store instanceof NativeStore))throw new Error('新版设置必须使用NativeStore')
-  const ownerActivity=async()=>ownerActivityReports(store,activity?.status?await activity.status():{tasks:[],blocks:[],available:false})
+  const ownerActivity=async()=>ownerActivityReports(store,activity?.status?await activity.status():{tasks:[],blocks:[],available:false},{reply_learning})
   const snapshot=async()=>{
     const documents={}
     for(const id of EDITABLE_DOCUMENTS){const row=store.getDocument(id);if(row)documents[id]=publicDocument(row)}
@@ -86,7 +101,8 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     try{if(typeof hormone?.status==='function')hormoneStatus=hormone.status()}catch{hormoneStatus={available:false}}
     return {ok:true,version:3,schema_version:3,documents,profiles:persona,updates:updates.status(),overview:{budget,mood,hormone:hormoneStatus,money_budget:tasks.money_budget??null,platforms:platformStatus},activity:tasks,
       capabilities:{documents:!store.readOnly,profiles:!store.readOnly,qq_main_persona:!store.readOnly&&typeof profiles.setQQMainFollow==='function',rounds:{bilibili:!!activity?.runOneRound&&!store.readOnly,tieba:!!activity?.runOneRound&&!store.readOnly},
-        memory:true,diary:true,update_check:true,persona_export:!!persona_export,tieba_diagnostics:!!tieba_diagnostics,expression_evolution:!!expression_evolution,daily_report:true,people:typeof people==='function',people_detail:typeof people_detail==='function',people_source:typeof people_source==='function',people_summary:typeof people_summarize==='function'&&!store.readOnly&&people_summary_enabled()===true,portability:!!portability,learning:{items:typeof learning_loop?.list==='function',manage:typeof learning_loop?.manage==='function'&&!store.readOnly,consolidate:typeof consolidate_learning==='function'&&!store.readOnly},
+        reply_learning:!!reply_learning&&!store.readOnly,
+        memory:true,diary:true,update_check:true,persona_export:!!persona_export,tieba_diagnostics:!!tieba_diagnostics,daily_report:true,people:typeof people==='function',people_detail:typeof people_detail==='function',people_source:typeof people_source==='function',people_summary:typeof people_summarize==='function'&&!store.readOnly&&people_summary_enabled()===true,portability:!!portability,learning:{items:typeof learning_loop?.list==='function',manage:typeof learning_loop?.manage==='function'&&!store.readOnly,consolidate:typeof consolidate_learning==='function'&&!store.readOnly},
         authentication:Object.fromEntries(PLATFORMS.map(p=>[p,!!platforms[p]?.login&&!store.readOnly])),platform_actions:{bilibili:{check_inbox:!!platforms.bilibili?.checkInbox&&!store.readOnly,reconcile_today:!!platforms.bilibili?.reconcileToday&&!store.readOnly},tieba:{atmosphere:typeof tieba_atmosphere?.list==='function',check_inbox:!!platforms.tieba?.checkInbox&&!store.readOnly,inspect_page:!!platforms.tieba?.inspectPage&&!store.readOnly,check_private:!!platforms.tieba?.checkPrivate&&!store.readOnly}}}}
   }
   const handlers=new Map(),route=(method,path,handler)=>handlers.set(method+' '+NATIVE_ADMIN_BASE+path,handler)
@@ -106,10 +122,6 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     return {ok:true,...model_default.status()}
   })
   route('POST','/updates/check',async(req)=>{const body=await readBody(req);allowedKeys(body,[]);return {ok:true,...await updates.check()}})
-  route('POST','/expression/status',async req=>{const body=await readBody(req);allowedKeys(body,['platform']);if(!expression_evolution)throw unavailable('语风尚未就绪');return {ok:true,...expression_evolution.status(body,ownerContext),candidates:expression_evolution.candidates(body,ownerContext).items,config:store.getDocument('expression-evolution')??{revision:0,value:{enabled:true,auto_adopt:false}}}})
-  route('POST','/expression/manage',async req=>{const body=await readBody(req);allowedKeys(body,['platform','operation','expected_revision','version','card_id']);if(!expression_evolution)throw unavailable('语风尚未就绪');return {ok:true,...expression_evolution.manage(body,ownerContext)}})
-  route('POST','/expression/adopt',async req=>{const body=await readBody(req);allowedKeys(body,['platform','expected_revision','card_id']);if(!expression_evolution)throw unavailable('语风尚未就绪');return {ok:true,...expression_evolution.adopt(body,ownerContext)}})
-  route('POST','/expression/config',async req=>{const body=await readBody(req);allowedKeys(body,['expected_revision','auto_adopt','enabled']);if(store.readOnly)throw Error('原生资料只读');const old=store.getDocument('expression-evolution');if(!Number.isSafeInteger(body.expected_revision)||body.expected_revision<0||body.auto_adopt!==undefined&&typeof body.auto_adopt!=='boolean'||body.enabled!==undefined&&typeof body.enabled!=='boolean')throw Error('语风开关参数无效');return {ok:true,document:store.putDocument({id:'expression-evolution',type:'expression_evolution',expected_revision:body.expected_revision,value:{enabled:true,auto_adopt:false,policy:{max_rules:4,max_context_chars:300,max_versions:16},...old?.value,...(body.enabled===undefined?{}:{enabled:body.enabled}),...(body.auto_adopt===undefined?{}:{auto_adopt:body.auto_adopt})}})}})
   route('POST','/persona/export',async req=>{const body=await readBody(req);allowedKeys(body,['kind','platform','version_id','bar','format']);if(!persona_export)throw unavailable('导出尚未就绪');return {ok:true,...persona_export.export(body,ownerContext)}})
   route('POST','/tieba/reconcile-publication',async req=>{const body=await readBody(req);allowedKeys(body,['action_id','post_id']);if(!reconcile_publication)throw unavailable('核验发表尚未就绪');return {ok:true,...await reconcile_publication(body,ownerContext)}})
   route('POST','/tieba/diagnostics',async req=>{const body=await readBody(req);allowedKeys(body,[]);if(!tieba_diagnostics)throw unavailable('自检尚未就绪');return {ok:true,...await tieba_diagnostics.check({},ownerContext)}})
@@ -141,7 +153,9 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     if(id==='learning'&&Object.hasOwn(body.patch,'active_revision')||id==='learning-loop'&&Object.keys(body.patch).some(key=>!['enabled','policy'].includes(key)))throw new Error('学习版本、来源和使用记录由实际学习过程维护，不能通过设置改写')
     if(id==='qq'&&Object.hasOwn(body.patch.qq??{},'relationships'))throw new Error('QQ亲疏由欧鲸鲸自主决定，不能通过设置指定名单')
     if(id==='qq'&&Object.hasOwn(body.patch.qq?.conversation??{},'workspace_id'))throw new Error('QQ 会话统一使用「欧鲸鲸的家」')
-    const value=merge(old.value,body.patch),document=store.putDocument({id,type:old.type,value,expected_revision:body.expected_revision})
+    const value=merge(old.value,body.patch)
+    if(id==='tieba')syncTiebaProactivePostBars(value.tieba,body.patch.tieba)
+    const document=store.putDocument({id,type:old.type,value,expected_revision:body.expected_revision})
     const effect=await on_change?.({document_id:id,type:old.type,revision:document.revision})
     return {ok:true,document:publicDocument(document),restart_required:effect?.restart_required===true,message:effect?.message||'已保存'}
   })
@@ -242,6 +256,19 @@ export function createNativeAdminApi({store,profiles=new NativeProfileService({s
     if(typeof learning_loop?.status!=='function')throw unavailable('学习状态暂时无法读取')
     const result=await learning_loop.status(ownerContext)
     return {ok:true,enabled:result.enabled,counts:result.counts,revision:result.revision,pending_sources:result.pending_sources}
+  })
+  route('GET','/learning/reply-likes',async(_req,url)=>{
+    if(!reply_learning)throw unavailable('回复点赞暂时无法读取')
+    if([...url.searchParams.keys()].some(key=>key!=='limit'))throw new Error('回复点赞筛选包含不支持的字段')
+    const limit=Number(url.searchParams.get('limit')??30)
+    if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('回复点赞数量无效')
+    return {ok:true,...reply_learning.list({limit},ownerContext)}
+  })
+  route('POST','/learning/reply-likes',async(req)=>{
+    if(!reply_learning)throw unavailable('回复点赞功能暂时不可用')
+    const body=await readBody(req)
+    allowedKeys(body,['action_id','liked'])
+    return {ok:true,...reply_learning.set(body,ownerContext)}
   })
   route('GET','/learning/detail',async(_req,url)=>{
     if(typeof learning_loop?.detail!=='function')throw unavailable('学习应用记录暂时无法读取')

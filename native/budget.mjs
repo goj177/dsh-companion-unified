@@ -50,15 +50,23 @@ export class NativeBudget {
   }
   _hold(meta) { return meta.reservation_open ? Math.max(0, meta.reserved_tokens - meta.actual_tokens) : 0 }
   _wakeCounts(date,total,tokens=0,reserved=0) {
-    const counts={manual_wakes:0,incoming_wakes:0,manual_tokens:0,manual_reserved_tokens:0,manual_uncertain_tokens:0}
+    const counts={manual_wakes:0,incoming_wakes:0,manual_tokens:0,manual_reserved_tokens:0,manual_uncertain_tokens:0,
+      exempt_automatic_tokens:0,exempt_automatic_reserved_tokens:0,exempt_automatic_uncertain_tokens:0}
     for(const row of this.store.db.prepare("SELECT id,metadata_json FROM actions WHERE kind='model.reservation' AND json_extract(metadata_json,'$.day')=?").all(date)){
       const meta=metadataOf(row);if(!meta.wake_charge)continue
       let kind=meta.wake_kind??this.wakeKinds.get(row.id)
       if(!kind){const linked=this.store.db.prepare("SELECT json_extract(metadata_json,'$.trigger') AS trigger FROM actions WHERE kind LIKE 'activity.%' AND json_extract(metadata_json,'$.reservation_id')=? LIMIT 1").get(row.id);kind=linked?.trigger??(meta.kind==='activity.incoming'?'incoming':'autonomous');this.wakeKinds.set(row.id,kind)}
       if(kind==='manual'){counts.manual_wakes+=meta.wake_charge;counts.manual_tokens+=meta.reservation_open?meta.actual_tokens:meta.charged_tokens;counts.manual_reserved_tokens+=this._hold(meta);if(!meta.reservation_open&&!meta.actual_known)counts.manual_uncertain_tokens+=meta.charged_tokens}
+      else if(meta.token_exempt===true){
+        counts.exempt_automatic_tokens+=meta.reservation_open?meta.actual_tokens:meta.charged_tokens
+        counts.exempt_automatic_reserved_tokens+=this._hold(meta)
+        if(!meta.reservation_open&&!meta.actual_known)counts.exempt_automatic_uncertain_tokens+=meta.charged_tokens
+      }
       if(kind==='incoming')counts.incoming_wakes+=meta.wake_charge
     }
-    return {...counts,autonomous_wakes:Math.max(0,total-counts.manual_wakes-counts.incoming_wakes),automatic_tokens:Math.max(0,tokens-counts.manual_tokens),automatic_reserved_tokens:Math.max(0,reserved-counts.manual_reserved_tokens)}
+    return {...counts,autonomous_wakes:Math.max(0,total-counts.manual_wakes-counts.incoming_wakes),
+      automatic_tokens:Math.max(0,tokens-counts.manual_tokens-counts.exempt_automatic_tokens),
+      automatic_reserved_tokens:Math.max(0,reserved-counts.manual_reserved_tokens-counts.exempt_automatic_reserved_tokens)}
   }
   _event(id, name, status, meta) {
     const key = id + ':' + name
@@ -68,10 +76,10 @@ export class NativeBudget {
         reserved_tokens: meta.reserved_tokens, actual_known: meta.actual_known, actual_tokens: meta.actual_tokens,
         charged_tokens: meta.charged_tokens, wake_charge: meta.wake_charge, ...(meta.wake_kind?{wake_kind:meta.wake_kind}:{}) } })
   }
-  reserve({ id, platform, kind, estimated_tokens, human = false, heavy = true, manual = false, trigger } = {}) {
+  reserve({ id, platform, kind, estimated_tokens, human = false, heavy = true, manual = false, trigger, token_exempt = false } = {}) {
     if (typeof id !== 'string' || !id || id.length > 512 || /[\0\r\n]/.test(id)
       || !['qq','tieba','bilibili','harness','system'].includes(platform) || typeof kind !== 'string' || !kind || kind.length > 100
-      || !nonnegative(estimated_tokens) || estimated_tokens < 1 || typeof human !== 'boolean' || typeof heavy !== 'boolean' || typeof manual !== 'boolean'
+      || !nonnegative(estimated_tokens) || estimated_tokens < 1 || typeof human !== 'boolean' || typeof heavy !== 'boolean' || typeof manual !== 'boolean' || typeof token_exempt !== 'boolean'
       || trigger!==undefined&&!['autonomous','manual','incoming'].includes(trigger)||manual&&trigger!==undefined&&trigger!=='manual') throw new Error('模型预算预留参数无效')
     const wake_kind=trigger??(manual?'manual':human?'incoming':'autonomous');manual=wake_kind==='manual'
     this._restore()
@@ -84,7 +92,7 @@ export class NativeBudget {
       if (!phase.valley && !urgent && !manual) return { allowed: false, reason: 'peak', not_before: phase.nextValleyAt }
       const remaining = policy.batching?.min_valley_remaining_ms ?? 120000
       if (!manual && heavy && Number.isFinite(phase.nextPeakAt) && at + remaining >= phase.nextPeakAt) return { allowed: false, reason: 'valley_ending', not_before: valleyDecision(phase.nextPeakAt + 1, { holidays: policy.holidays || [] }).nextValleyAt }
-      if (estimated_tokens > (budgetPolicy.max_task_tokens ?? 30000)) return { allowed: false, reason: 'task_reservation_too_large' }
+      if (!token_exempt && estimated_tokens > (budgetPolicy.max_task_tokens ?? 30000)) return { allowed: false, reason: 'task_reservation_too_large' }
       const date = shanghaiTime(at).date, reservation = 'reservation:' + hash(date + '\0' + id)
       const existing = this.store.db.prepare('SELECT status FROM actions WHERE id=?').get(reservation)
       if (existing) return { allowed: false, reason: 'duplicate', reservation_id: reservation, status: existing.status }
@@ -93,10 +101,10 @@ export class NativeBudget {
       if (open.length >= (policy.batching?.max_concurrent ?? 1)) return { allowed: false, reason: 'busy' }
       if (open.filter(row=>metadataOf(row).platform===platform).length >= (policy.batching?.max_per_platform ?? 1)) return { allowed: false, reason: 'busy' }
       const state = this._state(), day = this._day(state, date),counts=this._wakeCounts(date,day.wakes,day.tokens,day.reserved_tokens)
-      if (wake_kind==='autonomous'&&counts.autonomous_wakes >= (budgetPolicy.daily_wake_limit ?? 18) || wake_kind!=='manual'&&counts.automatic_tokens + counts.automatic_reserved_tokens + estimated_tokens > (budgetPolicy.daily_token_limit ?? 300000)) return { allowed: false, reason: 'budget' }
+      if (wake_kind==='autonomous'&&counts.autonomous_wakes >= (budgetPolicy.daily_wake_limit ?? 18) || !token_exempt&&wake_kind!=='manual'&&counts.automatic_tokens + counts.automatic_reserved_tokens + estimated_tokens > (budgetPolicy.daily_token_limit ?? 300000)) return { allowed: false, reason: 'budget' }
       const meta = { schema_version: 1, record_type: 'model_reservation', platform, kind, day: date,
         reserved_tokens: estimated_tokens, reservation_open: true, actual_known: false, actual_tokens: 0,
-        charged_tokens: 0, wake_charge: 1, wake_kind, started: false, lease_until: at + (policy.batching?.lease_ms ?? 900000) }
+        charged_tokens: 0, wake_charge: 1, wake_kind, ...(token_exempt?{token_exempt:true}:{}), started: false, lease_until: at + (policy.batching?.lease_ms ?? 900000) }
       const emptyDigest = hash('')
       this.store.db.prepare(`INSERT INTO actions(id,platform,kind,target_json,body,body_digest,request_digest,status,
         created_at,updated_at,not_before,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
@@ -169,8 +177,9 @@ export class NativeBudget {
     const p = this._policy(), current = this._day(this._state(), day)
     const counts=this._wakeCounts(day,current.wakes,current.tokens,current.reserved_tokens),budget = { day, wakes: current.wakes, tokens: counts.automatic_tokens, reserved_tokens: counts.automatic_reserved_tokens, total_tokens:current.tokens, total_reserved_tokens:current.reserved_tokens }
     const uncertain = this.store.db.prepare("SELECT COALESCE(SUM(json_extract(metadata_json,'$.charged_tokens')),0) AS n FROM actions WHERE kind='model.reservation' AND json_extract(metadata_json,'$.day')=? AND json_extract(metadata_json,'$.reservation_open')=0 AND json_extract(metadata_json,'$.actual_known')=0").get(day).n
-    return { ...budget, ...counts, manual_known_tokens:counts.manual_tokens-counts.manual_uncertain_tokens,daily_token_limit_scope:'automatic',daily_wake_limit_scope:'autonomous', known_tokens: budget.tokens - (uncertain-counts.manual_uncertain_tokens), uncertain_tokens: uncertain-counts.manual_uncertain_tokens,
+    const automatic_uncertain_tokens=uncertain-counts.manual_uncertain_tokens-counts.exempt_automatic_uncertain_tokens
+    return { ...budget, ...counts, manual_known_tokens:counts.manual_tokens-counts.manual_uncertain_tokens,daily_token_limit_scope:'automatic',daily_wake_limit_scope:'autonomous', known_tokens: budget.tokens - automatic_uncertain_tokens, uncertain_tokens: automatic_uncertain_tokens,
       daily_wake_limit: p.budget?.daily_wake_limit ?? 18, daily_token_limit: p.budget?.daily_token_limit ?? 300000,
-      enabled: p.enabled === true, model_calls: 0, note: '自主活动受每日次数限制；手动执行与来信分开计数。手动Token单列，不占每日自动活动Token预算；total_tokens保留全部实际及保守占额用量。未确认消耗按预留保守占额。' }
+      enabled: p.enabled === true, model_calls: 0, note: '自主活动受每日次数限制；手动执行与来信分开计数。手动执行和熟人印象整理的 Token 不占每日自动活动 Token 预算；total_tokens 保留全部实际及保守占额用量。未确认消耗按预留保守占额。' }
   }
 }
