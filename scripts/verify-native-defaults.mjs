@@ -20,6 +20,7 @@ try{
   assert.ok(store.listPersonaProfiles().every(row=>row.follow_main===false),'fresh platform drafts stay independently blank')
   for(const row of store.listPersonaProfiles()){for(const field of ['name','self_ref','owner_address','body_md'])assert.equal(row[field],'');assert.deepEqual(row.traits,{});for(const field of ['samples','quirks','particles','patterns'])assert.deepEqual(row.voice[field],[])}
   assert.deepEqual(store.getDocument('tieba').value.tieba.bars,[])
+  assert.deepEqual(store.getDocument('tieba').value.tieba.proactive_post_bars,[])
   const snapshot=store.listDocuments({limit:1000});assert.equal(initNativeDefaults(store).initialized,false);assert.deepEqual(store.listDocuments({limit:1000}),snapshot)
   const partial=open('partial');partial.createEntity({kind:'person',display_name:'已有资料'});assert.throws(()=>initNativeDefaults(partial),/已有部分资料/)
   const explicit=open('explicit-owner');initNativeDefaults(explicit,{owner:{id:'owner-explicit',display_name:'明确的本机主人',identities:[{namespace:'harness',platform_uid:'local-owner'}]}})
